@@ -58,8 +58,10 @@ pub use scheduler::delete::{SCHEDULER_DELETE_TOOL_NAME, SchedulerDeleteTool};
 pub use scheduler::list::SchedulerListTool;
 pub use search_replace::SearchReplaceTool;
 pub use sky::{
-    ClickTool, DragTool, GetAppStateTool, ListAppsTool, PerformSecondaryActionTool, PressKeyTool,
-    ScrollTool, SelectTextTool, SetValueTool, TypeTextTool,
+    BrowsersListTool, ClickTool, DragTool, GetAppStateTool, ListAppsTool, PageClickTool,
+    PageCloseTool, PageContentTool, PageGotoTool, PageScreenshotTool, PageTypeTool,
+    PerformSecondaryActionTool, PressKeyTool, ScrollTool, SelectTextTool, SetValueTool,
+    TabsListTool, TypeTextTool,
 };
 pub use task::{TaskTool, is_task_tool_id};
 pub use task_output::{GetTerminalCommandOutputTool, TaskOutputTool, WaitTasksTool};

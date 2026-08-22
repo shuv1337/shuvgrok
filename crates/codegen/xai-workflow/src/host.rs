@@ -15,6 +15,10 @@ pub struct AgentOpts {
     pub agent_type: Option<String>,
     #[serde(default)]
     pub capability_mode: Option<String>,
+    /// Explicit isolation mode: `"none"`, `"worktree"`, or `"rift"`.
+    /// Takes precedence over [`Self::isolation_worktree`].
+    #[serde(default)]
+    pub isolation: Option<String>,
     #[serde(default)]
     pub isolation_worktree: bool,
     #[serde(default)]

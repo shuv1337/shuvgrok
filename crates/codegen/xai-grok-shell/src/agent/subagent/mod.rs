@@ -97,6 +97,34 @@ impl AutoCompactThresholdTiers {
         }
     }
 }
+/// Spawn-time snapshot of `[subagent_fanout]`: the ordered pool of catalog
+/// ids plus the id fanout applies to. Captured from the parent `Config` at
+/// spawn-context build time; per-endpoint credential gating happens later,
+/// in [`resolve_effective_model_config`], where the resolved model entries
+/// are available.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SubagentFanoutRuntime {
+    /// Catalog id fanout matches against (`default_model`). Fanout applies
+    /// only when a sub-agent's base resolution lands on this family.
+    pub default_model: String,
+    /// Ordered pool of catalog ids; entry 0 is the preferred start before
+    /// spawn rotation reorders it.
+    pub pool: Vec<String>,
+}
+impl SubagentFanoutRuntime {
+    pub(crate) fn from_config(
+        cfg: Option<&crate::agent::config::SubagentFanoutConfig>,
+    ) -> Option<Self> {
+        let cfg = cfg.filter(|c| c.enabled)?;
+        if cfg.pool.is_empty() {
+            return None;
+        }
+        Some(Self {
+            default_model: cfg.default_model.clone()?,
+            pool: cfg.pool.clone(),
+        })
+    }
+}
 /// Everything the coordinator needs from MvpAgent to spawn a child session.
 /// Avoids passing `&MvpAgent` (which would require the coordinator to know
 /// about the full agent struct). Built by `MvpAgent::build_subagent_spawn_context()`.
@@ -220,6 +248,10 @@ pub(crate) struct SubagentSpawnContext {
     pub parent_max_turns: Option<usize>,
     /// All available models for resolving model IDs from overrides.
     pub available_models: indexmap::IndexMap<String, crate::agent::config::ModelEntry>,
+    /// `[subagent_fanout]` snapshot (enabled + pool + default id), captured
+    /// from the parent's loaded Config. `None` when the section is absent
+    /// or disabled; fanout then never applies.
+    pub fanout: Option<SubagentFanoutRuntime>,
     /// Per-subagent model ID overrides from config.toml `[subagents.models]`.
     pub subagent_model_overrides: std::collections::HashMap<String, String>,
     /// Per-subagent enable/disable toggles from config.toml `[subagents.toggle]`.
@@ -671,6 +703,11 @@ async fn resolve_subagent_sampling_config(
 /// model warns and falls through to the pin path; `None` (inherit) hands
 /// precedence back to the pin path entirely (pin > agent-def > inherit).
 ///
+/// AFTER that base resolution, `[subagent_fanout]` may attach an ordered
+/// failover pool — but ONLY when the resolved model id equals the fanout
+/// `default_model` (the ox-alpha family). Explicit overrides/pins for OTHER
+/// models are never hijacked: their resolution returns untouched.
+///
 /// Extracted from `run_shell_child` so the precedence is unit-testable
 /// without spawning a child session.
 async fn resolve_effective_model_config(
@@ -681,14 +718,187 @@ async fn resolve_effective_model_config(
 ) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
     if let Some(model_id) = runtime_override_model {
         if let Some(resolved) = resolve_model_override_to_config(model_id, ctx) {
-            return resolved;
+            return apply_subagent_fanout(&resolved, FanoutProvenance::Explicit, ctx);
         }
         tracing::warn!(
             model_id,
             "Runtime model override references unknown model, falling through"
         );
     }
-    resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await
+    let base = resolve_subagent_sampling_config(subagent_type, definition_model, ctx).await;
+    // Inherit-parent carries no explicit catalog id on the config itself;
+    // the parent session's catalog id (`ctx.model_id`) decides the match.
+    apply_subagent_fanout(&base, FanoutProvenance::InheritedParent, ctx)
+}
+/// Process-global rotation counter: each fanout-applied spawn takes the next
+/// starting index, spreading concurrent sub-agents across the pool.
+static FANOUT_ROTATION: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+fn reset_fanout_rotation_for_test() {
+    FANOUT_ROTATION.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+/// Where the base resolution came from — decides which id fanout matches
+/// against. An explicit override matches its own catalog id; inherit-parent
+/// matches the parent session's catalog id (`ctx.model_id`), because the
+/// inherited `SamplerConfig` carries only the raw routing slug, not the
+/// user-facing `[model.*]` key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FanoutProvenance {
+    /// Runtime override / config pin / agent-definition pin resolved to a
+    /// known model; match against that resolved catalog id.
+    Explicit,
+    /// Nothing matched and the parent's live sampling config was inherited;
+    /// match against the parent session's catalog id.
+    InheritedParent,
+}
+impl FanoutProvenance {
+    fn matched_catalog_id<'a>(
+        self,
+        resolved_id: &'a acp::ModelId,
+        ctx: &'a SubagentSpawnContext,
+    ) -> &'a str {
+        match self {
+            Self::Explicit => resolved_id.0.as_ref(),
+            Self::InheritedParent => ctx.model_id.0.as_ref(),
+        }
+    }
+}
+/// Maybe attach a `[subagent_fanout]` failover pool onto a completed base
+/// resolution. No-op unless fanout is enabled AND the base landed on the
+/// fanout default family — explicit overrides for other models and every
+/// non-default pin pass through byte-for-byte.
+///
+/// Pool membership is gated on PROVABLE credentials: an entry enters the
+/// pool only when its own credential resolves non-empty at build time
+/// (`own_credential().is_some()`). The first surviving entry becomes the
+/// active provider; the rest ride `SamplerConfig.failover_pool` for the
+/// sampler's [`xai_grok_sampler::FailoverState`] to walk on failure. The
+/// sampler treats pool index 0 as the first alternate, so the per-spawn
+/// rotation REORDERS the vec (`rotate_left(start_idx)`) and overwrites the
+/// active SamplerConfig from that same first endpoint, keeping active ==
+/// pool[0] post-rotation by construction.
+fn apply_subagent_fanout(
+    resolved: &(xai_grok_sampler::SamplerConfig, acp::ModelId),
+    provenance: FanoutProvenance,
+    ctx: &SubagentSpawnContext,
+) -> (xai_grok_sampler::SamplerConfig, acp::ModelId) {
+    let Some(fanout) = ctx.fanout.as_ref() else {
+        return resolved.clone();
+    };
+    let matched_id = provenance.matched_catalog_id(&resolved.1, ctx);
+    if matched_id != fanout.default_model {
+        return resolved.clone();
+    }
+    let mut endpoints = Vec::new();
+    for (position, id) in fanout.pool.iter().enumerate() {
+        let Some(entry) = crate::agent::config::find_model_by_id(&ctx.available_models, id)
+        else {
+            xai_grok_telemetry::unified_log::debug(
+                "subagent fanout pool built",
+                None,
+                Some(serde_json::json!({
+                    "model_id": id,
+                    "position": position,
+                    "included": false,
+                    "reason": "unknown_catalog_id",
+                })),
+            );
+            continue;
+        };
+        if entry.own_credential().is_none() {
+            // Not provably configured: env unset (or Keychain miss) at this
+            // moment. Excluded so failover never lands on a dead endpoint.
+            xai_grok_telemetry::unified_log::debug(
+                "subagent fanout pool built",
+                None,
+                Some(serde_json::json!({
+                    "model_id": id,
+                    "position": position,
+                    "included": false,
+                    "reason": "no_own_credential",
+                })),
+            );
+            continue;
+        }
+        let session_key = ctx.auth.as_ref().map(|a| a.key.as_str());
+        let credentials = crate::agent::config::resolve_credentials(entry, session_key);
+        endpoints.push(failover_endpoint_for(entry, &credentials));
+        xai_grok_telemetry::unified_log::debug(
+            "subagent fanout pool built",
+            None,
+            Some(serde_json::json!({
+                "model_id": id,
+                "position": position,
+                "included": true,
+                "base_url": credentials.base_url,
+                "key_prefix": key_prefix(&credentials.api_key),
+            })),
+        );
+    }
+    if endpoints.is_empty() {
+        xai_grok_telemetry::unified_log::debug(
+            "subagent fanout pool built",
+            None,
+            Some(serde_json::json!({
+                "reason": "no_credentialed_entries",
+                "pool": fanout.pool,
+            })),
+        );
+        return resolved.clone();
+    }
+    // Deterministic round-robin start: reorder so THIS sub-agent's assigned
+    // endpoint is pool[0] (= the sampler's active/primary alternate).
+    let pool_len = endpoints.len();
+    let start_idx =
+        FANOUT_ROTATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % pool_len;
+    endpoints.rotate_left(start_idx);
+    let mut config = resolved.0.clone();
+    let chosen = &endpoints[0];
+    // The active config must equal pool[0] post-rotation: overwrite the
+    // connection fields from the SAME endpoint object the vec leads with.
+    config.base_url.clone_from(&chosen.base_url);
+    config.model.clone_from(&chosen.model);
+    config.api_key.clone_from(&chosen.api_key);
+    config.auth_scheme = chosen.auth_scheme;
+    config.api_backend = chosen.api_backend.clone();
+    config.extra_headers.clone_from(&chosen.extra_headers);
+    config.query_params.clone_from(&chosen.query_params);
+    config.failover_pool = (pool_len > 1).then(|| xai_grok_sampler::config::FailoverPool {
+        endpoints: endpoints.clone(),
+    });
+    xai_grok_telemetry::unified_log::debug(
+        "subagent fanout applied",
+        None,
+        Some(serde_json::json!({
+            "matched_catalog_id": matched_id,
+            "default_model": fanout.default_model,
+            "provenance": format!("{provenance:?}"),
+            "pool_len": pool_len,
+            "start_idx": start_idx,
+            "active_base_url": &chosen.base_url,
+            "alternates": pool_len.saturating_sub(1),
+        })),
+    );
+    (config, resolved.1.clone())
+}
+/// Convert one credentialed catalog entry into a sampler failover endpoint.
+/// Reuses the same credential resolution as the main path
+/// (`resolve_credentials` → the fields `sampling_config_for_model` stamps),
+/// minus session-local extras (bearer resolver, attribution, client ids):
+/// a failover hop must work with ONLY what it carries in this struct.
+pub(crate) fn failover_endpoint_for(
+    entry: &crate::agent::config::ModelEntry,
+    credentials: &crate::agent::config::ResolvedCredentials,
+) -> xai_grok_sampler::config::FailoverEndpoint {
+    xai_grok_sampler::config::FailoverEndpoint {
+        base_url: credentials.base_url.clone(),
+        model: entry.info().model.clone(),
+        api_key: credentials.api_key.clone(),
+        auth_scheme: credentials.auth_scheme,
+        api_backend: entry.info().api_backend.clone(),
+        extra_headers: entry.info().extra_headers.clone(),
+        query_params: entry.info().query_params.clone(),
+    }
 }
 /// Truncate an API key to a safe prefix for logging. Counts characters, not
 /// bytes: a configured key with a multi-byte character would panic a byte
@@ -839,6 +1049,7 @@ async fn read_parent_sampling_config(
                     .model_compaction_at_tokens(catalog_model_id.0.as_ref()),
                 doom_loop_recovery: ctx.sampling_config.doom_loop_recovery,
                 header_injector: ctx.sampling_config.header_injector.clone(),
+                failover_pool: None,
             };
             let model_id = ctx.model_id.clone();
             let global_model_id = ctx.models_manager.current_model_id();

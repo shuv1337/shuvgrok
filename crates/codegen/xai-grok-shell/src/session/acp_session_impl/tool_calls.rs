@@ -2880,6 +2880,16 @@ impl SessionActor {
                 )
                 .await;
             }
+            SamplingEvent::ProviderFailedOver { to_base_url, to_model, .. } => {
+                xai_grok_telemetry::unified_log::warn(
+                    "shell.turn.provider_failover",
+                    Some(self.session_info.id.0.as_ref()),
+                    Some(serde_json::json!({
+                        "to_base_url": to_base_url,
+                        "to_model": to_model,
+                    })),
+                );
+            }
         }
     }
     /// Model-facing rejection for a non-plan-file edit while plan mode is

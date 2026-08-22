@@ -454,6 +454,9 @@ impl MvpAgent {
             parent_chat_state,
             parent_max_turns,
             available_models,
+            fanout: crate::agent::subagent::SubagentFanoutRuntime::from_config(
+                self.cfg.borrow().subagent_fanout.as_ref(),
+            ),
             subagent_model_overrides,
             subagent_toggle,
             subagent_roles,

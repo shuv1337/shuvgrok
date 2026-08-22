@@ -52,9 +52,10 @@ pub struct TaskToolInput {
 
     /// Isolation mode for the child's execution environment.
     #[schemars(
-        description = "Isolation mode: \"none\" (default, shared workspace) or \"worktree\" \
-            (isolated git worktree). Worktree mode prevents the child's edits from \
-            affecting the parent workspace until explicitly merged."
+        description = "Isolation mode: \"none\" (shared workspace), \"worktree\" \
+            (isolated git worktree with CoW ignored deps), or \"rift\" \
+            (anomaly rift --copy-all including node_modules). Isolated modes \
+            prevent the child's edits from affecting the parent until merged."
     )]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub isolation: Option<SubagentIsolationMode>,
@@ -189,6 +190,8 @@ pub enum SubagentIsolationMode {
     None,
     #[serde(alias = "Worktree", alias = "work_tree", alias = "work-tree")]
     Worktree,
+    #[serde(alias = "Rift", alias = "copy-all", alias = "copy_all")]
+    Rift,
 }
 
 impl SubagentIsolationMode {
@@ -197,7 +200,13 @@ impl SubagentIsolationMode {
         match self {
             Self::None => "none",
             Self::Worktree => "worktree",
+            Self::Rift => "rift",
         }
+    }
+
+    /// True when the child should not share the parent working tree.
+    pub fn is_isolated(self) -> bool {
+        !matches!(self, Self::None)
     }
 }
 
@@ -1126,7 +1135,7 @@ pub fn build_task_description(subagents: &[SubagentDescriptor], naming: &TaskToo
          - Use {resume_from_param} to continue a previously completed subagent's conversation. Pass the subagent_id returned by a prior {task_tool} call. A resumed agent keeps its full transcript and tool state, so you only need to describe what changed since the last run — don't re-explain the original task.\n\
          - The resumed agent must use the same subagent_type as the source.\n\n\
          Isolation mode:\n\
-         - Use {isolation_param} to control the child's execution environment. With \"worktree\", the child runs in an isolated git worktree whose edits don't affect the parent workspace; the worktree is preserved after completion and its path is returned in the output."
+         - Use {isolation_param} to control the child's execution environment. With \"worktree\", the child runs in an isolated git worktree (CoW of ignored deps such as node_modules). With \"rift\", the child is created with anomaly `rift create --copy-all` (same isolation contract; falls back to the worktree path if rift is missing). Isolated trees are preserved after completion and the path is returned in the output. Mutually exclusive with cwd."
     );
 
     out

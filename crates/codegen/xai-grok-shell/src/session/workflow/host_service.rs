@@ -484,9 +484,25 @@ impl HostService {
                 })?,
             ),
         };
-        let isolation = opts
-            .isolation_worktree
-            .then_some(xai_tool_types::SubagentIsolationMode::Worktree);
+        let isolation = if let Some(raw) = opts
+            .isolation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(
+                serde_json::from_value(serde_json::Value::String(raw.to_string())).map_err(
+                    |_| {
+                        HostError::Failed(format!(
+                            "invalid isolation '{raw}' (expected none, worktree, or rift)"
+                        ))
+                    },
+                )?,
+            )
+        } else {
+            opts.isolation_worktree
+                .then_some(xai_tool_types::SubagentIsolationMode::Worktree)
+        };
         let subagent_type = opts
             .agent_type
             .clone()

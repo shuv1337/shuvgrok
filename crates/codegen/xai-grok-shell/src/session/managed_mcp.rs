@@ -139,7 +139,13 @@ pub(crate) fn merge_managed_mcp_servers_with_policy(
         servers.insert(mcp_server_key(&server), server);
     }
 
-    let disabled = crate::util::config::disabled_mcp_server_names(cwd);
+    let mut disabled = crate::util::config::disabled_mcp_server_names(cwd);
+    // Native GrokBuild Sky tools already cover the desktop methods. Keep the
+    // MCP `sky` server off unless SKY_KEEP_MCP is set, so the model does not
+    // see both `list_apps` and `sky__list_apps`.
+    if xai_grok_tools::implementations::grok_build::sky::suppresses_duplicate_sky_mcp("sky") {
+        disabled.insert("sky".to_string());
+    }
 
     let mut merged: Vec<acp::McpServer> = servers.into_values().collect();
     // Deterministic order: this list is collected from a HashMap (random)

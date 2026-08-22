@@ -27,6 +27,73 @@ pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
     format!("model_provider:{provider_id}")
 }
 
+/// Lenient parse of the `[subagent_fanout]` top-level table.
+///
+/// Follows the `[model_providers]` conventions: unknown fields warn and are
+/// ignored, a non-table section warns once, and a malformed entry is dropped
+/// with an `InvalidValue` warning instead of failing config load. Validation
+/// against the catalog (`[model.*]` ids) happens in
+/// [`super::config::validate_subagent_fanout`], after all sections are parsed.
+pub(crate) fn parse_subagent_fanout(
+    raw_config: &toml::Value,
+) -> (Option<crate::agent::config::SubagentFanoutConfig>, Vec<ConfigWarning>) {
+    let mut warnings = Vec::new();
+    let Some(section) = raw_config.get("subagent_fanout") else {
+        return (None, warnings);
+    };
+    let Some(table) = section.as_table() else {
+        warnings.push(ConfigWarning::config_key(
+            "subagent_fanout".to_owned(),
+            ConfigWarningKind::NotATable,
+            format!(
+                "`subagent_fanout` must be a table, got {}; section ignored",
+                section.type_str()
+            ),
+        ));
+        return (None, warnings);
+    };
+    let mut unknown = Vec::new();
+    match serde_ignored::deserialize::<_, _, crate::agent::config::SubagentFanoutConfig>(
+        section.clone(),
+        |path| unknown.push(path.to_string()),
+    ) {
+        Ok(mut fanout) => {
+            for key in unknown {
+                warnings.push(ConfigWarning::config_key(
+                    format!("subagent_fanout.{key}"),
+                    ConfigWarningKind::UnknownField,
+                    "unrecognized key; field ignored".to_owned(),
+                ));
+            }
+            // Duplicate pool ids: keep first-occurrence order, warn once per
+            // duplicated id (not per occurrence).
+            let mut seen = std::collections::HashSet::new();
+            let mut deduped = Vec::with_capacity(fanout.pool.len());
+            for id in fanout.pool {
+                if !seen.insert(id.clone()) {
+                    warnings.push(ConfigWarning::config_key(
+                        format!("subagent_fanout.pool.{id}"),
+                        ConfigWarningKind::ConflictingFields,
+                        "duplicate model id in pool; later occurrences ignored".to_owned(),
+                    ));
+                    continue;
+                }
+                deduped.push(id);
+            }
+            fanout.pool = deduped;
+            (Some(fanout), warnings)
+        }
+        Err(error) => {
+            warnings.push(ConfigWarning::config_key(
+                "subagent_fanout".to_owned(),
+                ConfigWarningKind::InvalidValue,
+                format!("failed to parse ({error}); sub-agent failover fanout disabled"),
+            ));
+            (None, warnings)
+        }
+    }
+}
+
 pub(crate) fn auth_config_issues(
     config: &crate::auth::AuthProviderConfig,
 ) -> Vec<(&'static str, ConfigWarningKind, String)> {

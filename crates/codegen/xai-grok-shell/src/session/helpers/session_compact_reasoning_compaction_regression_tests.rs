@@ -198,6 +198,7 @@ fn test_config(base_url: &str) -> SamplerConfig {
         compaction_at_tokens: None,
         doom_loop_recovery: None,
         header_injector: None,
+        failover_pool: None,
         wire_identity: Default::default(),
         system_prompt_as_instructions: false,
     }

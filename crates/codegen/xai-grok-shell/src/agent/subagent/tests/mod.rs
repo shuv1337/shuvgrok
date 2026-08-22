@@ -2149,4 +2149,5 @@ fn spawn_test_parent_chat_state(model_slug: &str) -> xai_chat_state::ChatStateHa
         token,
     )
 }
+mod fanout;
 mod rest;

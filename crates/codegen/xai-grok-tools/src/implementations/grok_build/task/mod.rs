@@ -395,26 +395,27 @@ impl xai_tool_runtime::Tool for TaskTool {
         // Also strip stray surrounding quote characters and expand `~`.
         let cwd = input.cwd.as_deref().and_then(sanitize_cwd_value);
 
-        // Validate mutual exclusion: cwd and isolation=worktree cannot both
+        // Validate mutual exclusion: cwd and an isolated mode cannot both
         // be set. Both set the effective cwd — setting both is ambiguous.
         // However, if the cwd path doesn't exist as a real directory on disk,
-        // the model likely passed a nonsense path — just clear it so worktree wins.
-        let cwd = if cwd.is_some() && input.isolation == Some(SubagentIsolationMode::Worktree) {
+        // the model likely passed a nonsense path — just clear it so isolation wins.
+        let isolated = input.isolation.is_some_and(SubagentIsolationMode::is_isolated);
+        let cwd = if cwd.is_some() && isolated {
             if cwd
                 .as_deref()
                 .is_some_and(|p| std::path::Path::new(p).is_dir())
             {
                 return Err(xai_tool_runtime::ToolError::invalid_arguments(
-                    "cwd and isolation=\"worktree\" are mutually exclusive. \
+                    "cwd and isolation are mutually exclusive. \
                      Use cwd to point the subagent at an existing directory, \
-                     or isolation=\"worktree\" to create a new isolated worktree, \
-                     but not both.",
+                     or isolation=\"worktree\" / isolation=\"rift\" to create \
+                     a new isolated workspace, but not both.",
                 ));
             }
-            // Non-existent path alongside worktree — clear it so worktree wins.
+            // Non-existent path alongside isolation — clear it so isolation wins.
             tracing::debug!(
                 cwd = %cwd.as_deref().unwrap_or(""),
-                "clearing non-existent cwd path because isolation=worktree is set"
+                "clearing non-existent cwd path because isolation is set"
             );
             None
         } else {
@@ -1759,6 +1760,17 @@ mod tests {
     }
 
     #[test]
+    fn isolation_rift_parses() {
+        let input: TaskToolInput =
+            serde_json::from_str(r#"{"description": "d", "prompt": "p", "isolation": "rift"}"#)
+                .unwrap();
+        assert_eq!(input.isolation, Some(SubagentIsolationMode::Rift));
+        assert!(SubagentIsolationMode::Rift.is_isolated());
+        assert!(SubagentIsolationMode::Worktree.is_isolated());
+        assert!(!SubagentIsolationMode::None.is_isolated());
+    }
+
+    #[test]
     fn isolation_none_parses() {
         let input: TaskToolInput =
             serde_json::from_str(r#"{"description": "d", "prompt": "p", "isolation": "none"}"#)
@@ -1781,6 +1793,9 @@ mod tests {
             ("Worktree", SubagentIsolationMode::Worktree, "worktree"),
             ("work_tree", SubagentIsolationMode::Worktree, "worktree"),
             ("work-tree", SubagentIsolationMode::Worktree, "worktree"),
+            ("Rift", SubagentIsolationMode::Rift, "rift"),
+            ("copy-all", SubagentIsolationMode::Rift, "rift"),
+            ("copy_all", SubagentIsolationMode::Rift, "rift"),
         ] {
             let json = format!(r#"{{"description":"d","prompt":"p","isolation":"{alias}"}}"#);
             let input: TaskToolInput = serde_json::from_str(&json)
@@ -1799,6 +1814,7 @@ mod tests {
         for (mode, expected) in [
             (SubagentIsolationMode::None, "none"),
             (SubagentIsolationMode::Worktree, "worktree"),
+            (SubagentIsolationMode::Rift, "rift"),
         ] {
             assert_eq!(serde_json::to_value(mode).unwrap(), expected, "{mode:?}");
         }
@@ -2214,6 +2230,41 @@ mod tests {
         assert!(
             err.contains("mutually exclusive"),
             "should reject cwd + isolation=worktree: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cwd_and_rift_isolation_are_mutually_exclusive() {
+        let (backend, _rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(0));
+        resources.insert(SessionIdResource("parent".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-1".to_string()));
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(resources.into_shared()),
+            TaskToolInput {
+                description: "test cwd conflict".into(),
+                prompt: "work".into(),
+                subagent_type: "general-purpose".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: Some(SubagentIsolationMode::Rift),
+                resume_from: None,
+                cwd: Some("/tmp".into()),
+                model: None,
+                task_id: None,
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mutually exclusive"),
+            "should reject cwd + isolation=rift: {err}"
         );
     }
 

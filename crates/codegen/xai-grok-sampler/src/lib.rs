@@ -23,6 +23,7 @@ pub mod commands;
 pub mod config;
 pub mod doom_loop;
 pub mod events;
+pub mod failover;
 pub mod handle;
 pub mod metrics;
 pub mod retry;
@@ -38,8 +39,8 @@ pub use attribution::{
 };
 pub use client::{ApiBackend, SamplingClient, user_agent_string_for};
 pub use config::{
-    AuthScheme, BearerResolver, HeaderInjector, OriginClientInfo, RetryPolicy, SamplerConfig,
-    SharedBearerResolver, SharedHeaderInjector, WireIdentity,
+    AuthScheme, BearerResolver, FailoverEndpoint, FailoverPool, HeaderInjector, OriginClientInfo,
+    RetryPolicy, SamplerConfig, SharedBearerResolver, SharedHeaderInjector, WireIdentity,
 };
 pub use doom_loop::DoomLoopSignalCollector;
 pub use events::{

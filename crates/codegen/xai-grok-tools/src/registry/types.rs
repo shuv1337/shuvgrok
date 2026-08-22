@@ -722,6 +722,14 @@ impl ToolRegistryBuilder {
         b.register::<grok_build::SelectTextTool>();
         b.register::<grok_build::SetValueTool>();
         b.register::<grok_build::TypeTextTool>();
+        b.register::<grok_build::BrowsersListTool>();
+        b.register::<grok_build::TabsListTool>();
+        b.register::<grok_build::PageGotoTool>();
+        b.register::<grok_build::PageScreenshotTool>();
+        b.register::<grok_build::PageClickTool>();
+        b.register::<grok_build::PageTypeTool>();
+        b.register::<grok_build::PageContentTool>();
+        b.register::<grok_build::PageCloseTool>();
         b.register::<codex::apply_patch::ApplyPatchTool>();
         b.register::<codex::list_dir::CodexListDirTool>();
         b.register::<codex::grep_files::CodexGrepFilesTool>();
@@ -2938,6 +2946,8 @@ mod tests {
             "GrokBuild:get_app_state",
             "GrokBuild:click",
             "GrokBuild:type_text",
+            "GrokBuild:page_goto",
+            "GrokBuild:page_screenshot",
         ] {
             assert!(
                 builder.has_tool_id(id),

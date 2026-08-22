@@ -1,30 +1,56 @@
 //! First-class Sky Computer Use tools (same namespace as `read_file` / `list_dir`).
 //!
-//! These spawn the standalone `bin/sky` CLI from `agustif/sky-re` (signed node
-//! + SkyComputerUseClient). They are not MCP wrappers: the model sees
-//! `list_apps` / `get_app_state` / `click` as GrokBuild tools.
+//! These talk to a long-lived `bin/sky rpc` process from `agustif/sky-re`
+//! (signed node + SkyComputerUseClient). They are not MCP wrappers: the
+//! model sees `list_apps` / `get_app_state` / `click` as GrokBuild tools.
+
+mod rpc;
 
 use crate::types::output::ToolOutput;
 use crate::types::requirements::{Expr, ToolRequirement};
 use crate::types::tool::{ToolKind, ToolNamespace};
 use crate::types::tool_io::ToolInput;
+use rpc::{call_sky as call_sky_rpc, load_screenshot};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use std::time::Duration;
-use tokio::process::Command;
 
-const DEFAULT_TIMEOUT_SECS: u64 = 180;
+/// When true, the shell should not start the MCP server of this name.
+/// Native GrokBuild Sky tools already expose the same desktop methods.
+pub fn suppresses_duplicate_sky_mcp(server_name: &str) -> bool {
+    server_name.eq_ignore_ascii_case("sky") && std::env::var_os("SKY_KEEP_MCP").is_none()
+}
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub struct SkyOutput {
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_mime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_b64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screenshot_path: Option<String>,
 }
 
 impl xai_tool_runtime::ToolOutput for SkyOutput {
     fn model_output(&self) -> Vec<xai_tool_runtime::ContentBlock> {
-        vec![xai_tool_runtime::ContentBlock::Text {
+        let mut blocks = vec![xai_tool_runtime::ContentBlock::Text {
             text: self.text.clone(),
-        }]
+        }];
+        if let (Some(mime_type), Some(data)) = (&self.screenshot_mime, &self.screenshot_b64) {
+            blocks.push(xai_tool_runtime::ContentBlock::Image {
+                mime_type: mime_type.clone(),
+                data: data.clone(),
+                media_id: None,
+                filename: self
+                    .screenshot_path
+                    .as_ref()
+                    .and_then(|path| Path::new(path).file_name())
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned),
+                path: self.screenshot_path.clone(),
+                metadata: std::collections::HashMap::new(),
+            });
+        }
+        blocks
     }
 }
 
@@ -36,19 +62,51 @@ impl From<SkyOutput> for ToolOutput {
 
 impl From<String> for SkyOutput {
     fn from(text: String) -> Self {
-        Self { text }
+        Self {
+            text,
+            ..Self::default()
+        }
     }
 }
 
-fn timeout_secs() -> u64 {
-    std::env::var("SKY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|secs| *secs > 0)
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+fn sky_result_to_output(result: rpc::SkyCallResult) -> SkyOutput {
+    let mut output = SkyOutput {
+        text: result.text,
+        ..SkyOutput::default()
+    };
+    if let Some(url) = result.screenshot_url.as_deref()
+        && let Some((mime, data, path)) = load_screenshot(url)
+    {
+        output.screenshot_mime = Some(mime);
+        output.screenshot_b64 = Some(data);
+        if !path.is_empty() {
+            output.screenshot_path = Some(path);
+        }
+    }
+    output
 }
 
-fn sky_bin() -> Result<PathBuf, xai_tool_runtime::ToolError> {
+async fn sky(
+    method: &str,
+    args: serde_json::Value,
+) -> Result<SkyOutput, xai_tool_runtime::ToolError> {
+    call_sky_rpc(method, compact_json(args))
+        .await
+        .map(sky_result_to_output)
+}
+
+fn compact_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .filter(|(_, value)| !value.is_null())
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+pub(crate) fn sky_bin() -> Result<PathBuf, xai_tool_runtime::ToolError> {
     if let Ok(explicit) = std::env::var("SKY_BIN") {
         let path = PathBuf::from(explicit);
         if path.is_file() {
@@ -93,73 +151,6 @@ fn sky_bin() -> Result<PathBuf, xai_tool_runtime::ToolError> {
         "sky_not_found",
         "sky-standalone not found. Clone agustif/sky-re, run examples/setup.sh, set SKY_STANDALONE_ROOT.",
     ))
-}
-
-async fn run_sky(args: &[String]) -> Result<String, xai_tool_runtime::ToolError> {
-    let bin = sky_bin()?;
-    let mut command = Command::new(&bin);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let child = command.spawn().map_err(|error| {
-        xai_tool_runtime::ToolError::execution(
-            xai_tool_protocol::ToolId::new("sky").expect("id"),
-            format!("failed to spawn {}: {error}", bin.display()),
-        )
-    })?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(timeout_secs()),
-        child.wait_with_output(),
-    )
-    .await
-    .map_err(|_| {
-        xai_tool_runtime::ToolError::execution(
-            xai_tool_protocol::ToolId::new("sky").expect("id"),
-            format!(
-                "sky {} timed out after {}s",
-                args.first().map(String::as_str).unwrap_or("command"),
-                timeout_secs()
-            ),
-        )
-    })?
-    .map_err(|error| {
-        xai_tool_runtime::ToolError::execution(
-            xai_tool_protocol::ToolId::new("sky").expect("id"),
-            format!("sky failed: {error}"),
-        )
-    })?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr);
-        let out = String::from_utf8_lossy(&output.stdout);
-        return Err(xai_tool_runtime::ToolError::execution(
-            xai_tool_protocol::ToolId::new("sky").expect("id"),
-            format!("{err}{out}"),
-        ));
-    }
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if let Some(line) = stderr.lines().find(|line| line.starts_with("screenshot ")) {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
-        }
-        text.push_str(line);
-        text.push('\n');
-    }
-    Ok(text)
-}
-
-fn push_flag(args: &mut Vec<String>, flag: &str, value: impl ToString) {
-    args.push(flag.to_owned());
-    args.push(value.to_string());
-}
-
-fn push_opt(args: &mut Vec<String>, flag: &str, value: Option<impl ToString>) {
-    if let Some(value) = value {
-        push_flag(args, flag, value);
-    }
 }
 
 macro_rules! sky_tool {
@@ -225,7 +216,7 @@ macro_rules! sky_tool {
                 $input: $Input,
             ) -> Result<SkyOutput, xai_tool_runtime::ToolError> {
                 let _ = &$input;
-                $body.map(SkyOutput::from)
+                $body
             }
         }
     };
@@ -241,7 +232,7 @@ sky_tool!(
     ToolKind::List,
     ListAppsInput,
     |_input| {
-        run_sky(&["list_apps".into()]).await
+        sky("list_apps", serde_json::json!({})).await
     }
 );
 
@@ -261,12 +252,14 @@ sky_tool!(
     ToolKind::Read,
     GetAppStateInput,
     |input| {
-        let mut args = vec!["get_app_state".into()];
-        push_flag(&mut args, "--app", input.app);
-        if input.disable_diff.unwrap_or(false) {
-            push_flag(&mut args, "--disableDiff", "true");
-        }
-        run_sky(&args).await
+        sky(
+            "get_app_state",
+            serde_json::json!({
+                "app": input.app,
+                "disableDiff": input.disable_diff,
+            }),
+        )
+        .await
     }
 );
 
@@ -287,14 +280,18 @@ sky_tool!(
     ToolKind::Other,
     ClickInput,
     |input| {
-        let mut args = vec!["click".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_opt(&mut args, "--element_index", input.element_index);
-        push_opt(&mut args, "--x", input.x);
-        push_opt(&mut args, "--y", input.y);
-        push_opt(&mut args, "--mouse_button", input.mouse_button);
-        push_opt(&mut args, "--click_count", input.click_count);
-        run_sky(&args).await
+        sky(
+            "click",
+            serde_json::json!({
+                "app": input.app,
+                "element_index": input.element_index,
+                "x": input.x,
+                "y": input.y,
+                "mouse_button": input.mouse_button,
+                "click_count": input.click_count,
+            }),
+        )
+        .await
     }
 );
 
@@ -314,13 +311,17 @@ sky_tool!(
     ToolKind::Other,
     DragInput,
     |input| {
-        let mut args = vec!["drag".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--from_x", input.from_x);
-        push_flag(&mut args, "--from_y", input.from_y);
-        push_flag(&mut args, "--to_x", input.to_x);
-        push_flag(&mut args, "--to_y", input.to_y);
-        run_sky(&args).await
+        sky(
+            "drag",
+            serde_json::json!({
+                "app": input.app,
+                "from_x": input.from_x,
+                "from_y": input.from_y,
+                "to_x": input.to_x,
+                "to_y": input.to_y,
+            }),
+        )
+        .await
     }
 );
 
@@ -338,11 +339,15 @@ sky_tool!(
     ToolKind::Other,
     PerformSecondaryActionInput,
     |input| {
-        let mut args = vec!["perform_secondary_action".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--element_index", input.element_index);
-        push_flag(&mut args, "--action", input.action);
-        run_sky(&args).await
+        sky(
+            "perform_secondary_action",
+            serde_json::json!({
+                "app": input.app,
+                "element_index": input.element_index,
+                "action": input.action,
+            }),
+        )
+        .await
     }
 );
 
@@ -359,10 +364,14 @@ sky_tool!(
     ToolKind::Other,
     PressKeyInput,
     |input| {
-        let mut args = vec!["press_key".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--key", input.key);
-        run_sky(&args).await
+        sky(
+            "press_key",
+            serde_json::json!({
+                "app": input.app,
+                "key": input.key,
+            }),
+        )
+        .await
     }
 );
 
@@ -381,12 +390,16 @@ sky_tool!(
     ToolKind::Other,
     ScrollInput,
     |input| {
-        let mut args = vec!["scroll".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--element_index", input.element_index);
-        push_flag(&mut args, "--direction", input.direction);
-        push_opt(&mut args, "--pages", input.pages);
-        run_sky(&args).await
+        sky(
+            "scroll",
+            serde_json::json!({
+                "app": input.app,
+                "element_index": input.element_index,
+                "direction": input.direction,
+                "pages": input.pages,
+            }),
+        )
+        .await
     }
 );
 
@@ -407,14 +420,18 @@ sky_tool!(
     ToolKind::Other,
     SelectTextInput,
     |input| {
-        let mut args = vec!["select_text".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--element_index", input.element_index);
-        push_flag(&mut args, "--text", input.text);
-        push_opt(&mut args, "--prefix", input.prefix);
-        push_opt(&mut args, "--suffix", input.suffix);
-        push_opt(&mut args, "--selection_type", input.selection_type);
-        run_sky(&args).await
+        sky(
+            "select_text",
+            serde_json::json!({
+                "app": input.app,
+                "element_index": input.element_index,
+                "text": input.text,
+                "prefix": input.prefix,
+                "suffix": input.suffix,
+                "selection_type": input.selection_type,
+            }),
+        )
+        .await
     }
 );
 
@@ -432,11 +449,15 @@ sky_tool!(
     ToolKind::Other,
     SetValueInput,
     |input| {
-        let mut args = vec!["set_value".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--element_index", input.element_index);
-        push_flag(&mut args, "--value", input.value);
-        run_sky(&args).await
+        sky(
+            "set_value",
+            serde_json::json!({
+                "app": input.app,
+                "element_index": input.element_index,
+                "value": input.value,
+            }),
+        )
+        .await
     }
 );
 
@@ -453,11 +474,149 @@ sky_tool!(
     ToolKind::Other,
     TypeTextInput,
     |input| {
-        let mut args = vec!["type_text".into()];
-        push_flag(&mut args, "--app", input.app);
-        push_flag(&mut args, "--text", input.text);
-        run_sky(&args).await
+        sky(
+            "type_text",
+            serde_json::json!({
+                "app": input.app,
+                "text": input.text,
+            }),
+        )
+        .await
     }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct BrowsersListInput {}
+
+sky_tool!(
+    BrowsersListTool,
+    "browsers_list",
+    "List Playwright/CDP browsers this standalone CUA can attach to.",
+    ToolKind::List,
+    BrowsersListInput,
+    |_input| { sky("browsers_list", serde_json::json!({})).await }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct TabsListInput {}
+
+sky_tool!(
+    TabsListTool,
+    "tabs_list",
+    "List open pages in the Playwright browser session.",
+    ToolKind::List,
+    TabsListInput,
+    |_input| { sky("tabs_list", serde_json::json!({})).await }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageGotoInput {
+    pub url: String,
+    pub new_tab: Option<bool>,
+}
+
+sky_tool!(
+    PageGotoTool,
+    "page_goto",
+    "Navigate the current (or new) Playwright page to a URL.",
+    ToolKind::Other,
+    PageGotoInput,
+    |input| {
+        sky(
+            "page_goto",
+            serde_json::json!({
+                "url": input.url,
+                "new_tab": input.new_tab,
+            }),
+        )
+        .await
+    }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageScreenshotInput {}
+
+sky_tool!(
+    PageScreenshotTool,
+    "page_screenshot",
+    "Screenshot the current Playwright page. Returns a PNG image.",
+    ToolKind::Read,
+    PageScreenshotInput,
+    |_input| { sky("page_screenshot", serde_json::json!({})).await }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageClickInput {
+    pub selector: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+}
+
+sky_tool!(
+    PageClickTool,
+    "page_click",
+    "Click a CSS selector or viewport coordinate on the current Playwright page.",
+    ToolKind::Other,
+    PageClickInput,
+    |input| {
+        sky(
+            "page_click",
+            serde_json::json!({
+                "selector": input.selector,
+                "x": input.x,
+                "y": input.y,
+            }),
+        )
+        .await
+    }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageTypeInput {
+    pub text: String,
+    pub selector: Option<String>,
+}
+
+sky_tool!(
+    PageTypeTool,
+    "page_type",
+    "Type text into the focused Playwright element or a CSS selector.",
+    ToolKind::Other,
+    PageTypeInput,
+    |input| {
+        sky(
+            "page_type",
+            serde_json::json!({
+                "text": input.text,
+                "selector": input.selector,
+            }),
+        )
+        .await
+    }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageContentInput {}
+
+sky_tool!(
+    PageContentTool,
+    "page_content",
+    "Read the current Playwright page URL, title, and visible text.",
+    ToolKind::Read,
+    PageContentInput,
+    |_input| { sky("page_content", serde_json::json!({})).await }
+);
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+pub struct PageCloseInput {}
+
+sky_tool!(
+    PageCloseTool,
+    "page_close",
+    "Close the Playwright browser session.",
+    ToolKind::Other,
+    PageCloseInput,
+    |_input| { sky("page_close", serde_json::json!({})).await }
 );
 
 #[cfg(test)]
@@ -497,13 +656,33 @@ mod tests {
             xai_tool_runtime::Tool::id(&TypeTextTool).as_str(),
             "type_text"
         );
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&BrowsersListTool).as_str(),
+            "browsers_list"
+        );
+        assert_eq!(xai_tool_runtime::Tool::id(&TabsListTool).as_str(), "tabs_list");
+        assert_eq!(xai_tool_runtime::Tool::id(&PageGotoTool).as_str(), "page_goto");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageScreenshotTool).as_str(),
+            "page_screenshot"
+        );
+        assert_eq!(xai_tool_runtime::Tool::id(&PageClickTool).as_str(), "page_click");
+        assert_eq!(xai_tool_runtime::Tool::id(&PageTypeTool).as_str(), "page_type");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageContentTool).as_str(),
+            "page_content"
+        );
+        assert_eq!(xai_tool_runtime::Tool::id(&PageCloseTool).as_str(), "page_close");
     }
 
     #[test]
     fn read_tools_are_read_only() {
         assert!(xai_tool_runtime::Tool::capabilities(&ListAppsTool).is_read_only);
         assert!(xai_tool_runtime::Tool::capabilities(&GetAppStateTool).is_read_only);
+        assert!(xai_tool_runtime::Tool::capabilities(&PageScreenshotTool).is_read_only);
+        assert!(xai_tool_runtime::Tool::capabilities(&PageContentTool).is_read_only);
         assert!(!xai_tool_runtime::Tool::capabilities(&ClickTool).is_read_only);
+        assert!(!xai_tool_runtime::Tool::capabilities(&PageGotoTool).is_read_only);
         assert!(!xai_tool_runtime::Tool::capabilities(&TypeTextTool).is_read_only);
     }
 
@@ -514,6 +693,37 @@ mod tests {
             ToolInput::Dynamic(value) => assert!(value.is_object()),
             other => panic!("expected Dynamic, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn suppresses_mcp_sky_by_default() {
+        assert!(suppresses_duplicate_sky_mcp("sky"));
+        assert!(suppresses_duplicate_sky_mcp("SKY"));
+        assert!(!suppresses_duplicate_sky_mcp("playwright"));
+    }
+
+    #[test]
+    fn get_app_state_output_includes_image_block() {
+        let output = SkyOutput {
+            text: "AX tree".into(),
+            screenshot_mime: Some("image/png".into()),
+            screenshot_b64: Some("abcd".into()),
+            screenshot_path: Some("/tmp/shot.png".into()),
+        };
+        let blocks = xai_tool_runtime::ToolOutput::model_output(&output);
+        assert!(matches!(
+            &blocks[0],
+            xai_tool_runtime::ContentBlock::Text { text } if text == "AX tree"
+        ));
+        assert!(matches!(
+            &blocks[1],
+            xai_tool_runtime::ContentBlock::Image {
+                mime_type,
+                data,
+                path,
+                ..
+            } if mime_type == "image/png" && data == "abcd" && path.as_deref() == Some("/tmp/shot.png")
+        ));
     }
 
     #[tokio::test]

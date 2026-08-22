@@ -200,12 +200,10 @@ pub(crate) async fn run_shell_child(
         return child_run_output(failure_result(&request, &error), completion_data, None);
     }
     let worktree_path = if let Some(ref source) = resume_source {
-        if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None
-            && source.worktree_path.is_none()
-        {
+        if effective_runtime.isolation.is_isolated() && source.worktree_path.is_none() {
             tracing::info!(
                 subagent_id = %request.id,
-                "Ignoring isolation=worktree override: resumed source had no worktree"
+                "Ignoring isolation override: resumed source had no worktree"
             );
         }
         match source.worktree_path.as_deref() {
@@ -254,9 +252,9 @@ pub(crate) async fn run_shell_child(
                 }
             }
         }
-    } else if effective_runtime.isolation != xai_tool_types::SubagentIsolationMode::None {
-        let source_cwd = parent_source_cwd(&ctx);
-        let dest = match crate::session::worktree::worktree_base_dir_for_source(&source_cwd) {
+    } else if effective_runtime.isolation.is_isolated() {
+        let source_repo = resolve_subagent_source_repo(&ctx);
+        let dest = match crate::session::worktree::worktree_base_dir_for_source(&source_repo) {
             Ok(base) => base.join(format!("subagent-{}", request.id)),
             Err(e) => {
                 tracing::warn!(
@@ -269,37 +267,54 @@ pub(crate) async fn run_shell_child(
                     .join(&request.id)
             }
         };
-        let source_clone = source_cwd;
+        let worktree_cfg = ctx
+            .parent_session_info
+            .as_ref()
+            .and_then(|_| {
+                crate::config::load_effective_config().ok().and_then(|v| {
+                    v.get("worktree")?
+                        .clone()
+                        .try_into::<crate::agent::config::WorktreeConfigSection>()
+                        .ok()
+                })
+            })
+            .unwrap_or_default();
+        let backend = crate::session::worktree::IsolationBackend::from_config_and_mode(
+            worktree_cfg.isolation_backend.as_deref(),
+            effective_runtime.isolation,
+        );
+        let copy_ignored = worktree_cfg.copy_ignored.unwrap_or(true);
+        let ensure_js = worktree_cfg.ensure_js_deps.unwrap_or(true);
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
         match tokio::task::spawn_blocking(move || {
-            let mut builder = xai_fast_worktree::WorktreeBuilder::new(&source_clone, &dest)
-                .working_tree_mode(xai_fast_worktree::WorkingTreeMode::PreserveWorkingTree)
-                .creation_mode(creation_mode)
-                .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
-                .session_id(subagent_id);
-            if let Some(delegate) = btrfs_delegate {
-                builder = builder.btrfs_delegate(delegate);
-            }
-            builder.create()
+            crate::session::worktree::create_subagent_isolation(
+                &source_repo,
+                &dest,
+                &subagent_id,
+                backend,
+                copy_ignored,
+                ensure_js,
+                creation_mode,
+                btrfs_delegate,
+            )
         })
         .await
         {
-            Ok(Ok(report)) => {
+            Ok(Ok(path)) => {
                 tracing::info!(
                     subagent_id = %request.id,
-                    worktree_path = %report.worktree_path.display(),
-                    commit = %report.commit,
-                    "Created isolated worktree for subagent"
+                    worktree_path = %path.display(),
+                    "Created isolated workspace for subagent"
                 );
-                Some(report.worktree_path)
+                Some(path)
             }
             Ok(Err(e)) => {
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Failed to create worktree, falling back to shared workspace"
+                    "Failed to create isolated workspace, falling back to shared workspace"
                 );
                 None
             }
@@ -307,7 +322,7 @@ pub(crate) async fn run_shell_child(
                 tracing::warn!(
                     subagent_id = %request.id,
                     error = %e,
-                    "Worktree creation task panicked, falling back to shared workspace"
+                    "Isolation creation task panicked, falling back to shared workspace"
                 );
                 None
             }

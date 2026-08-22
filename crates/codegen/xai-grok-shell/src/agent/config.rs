@@ -108,8 +108,19 @@ impl EnvKeys {
         }
     }
     /// Resolve the first set, non-blank process env value among configured names.
+    ///
+    /// On macOS a process-env miss consults the login Keychain (generic password
+    /// with service `shuvgrok/env/<NAME>`). Terminal apps launched before a key
+    /// was exported (e.g. via `launchctl setenv`) never see it through process
+    /// env, which silently downgraded BYOK models to the session token; the
+    /// Keychain copy is visible to every launch context. Results are cached for
+    /// the process lifetime because each miss would otherwise spawn `security`.
     pub(crate) fn resolve_value(&self) -> Option<String> {
-        self.resolve_value_with(|name| std::env::var(name).ok())
+        self.resolve_value_with(|name| {
+            std::env::var(name)
+                .ok()
+                .or_else(|| keychain_env_fallback(name))
+        })
     }
     /// Testable resolve with an injected getenv.
     pub(crate) fn resolve_value_with(
@@ -126,6 +137,48 @@ impl EnvKeys {
         None
     }
 }
+/// Keychain-backed getenv fallback for [`EnvKeys::resolve_value`] on macOS.
+#[cfg(target_os = "macos")]
+fn keychain_env_fallback(name: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cache() -> &'static Mutex<HashMap<String, Option<String>>> {
+        static CACHE: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+        CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn lookup_uncached(name: &str) -> Option<String> {
+        let output = std::process::Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                &format!("shuvgrok/env/{name}"),
+                "-w",
+            ])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!value.is_empty()).then_some(value)
+    }
+
+    let mut cache = cache().lock().ok()?;
+    if let Some(hit) = cache.get(name) {
+        return hit.clone();
+    }
+    let value = lookup_uncached(name);
+    cache.insert(name.to_owned(), value.clone());
+    value
+}
+
+#[cfg(not(target_os = "macos"))]
+fn keychain_env_fallback(_name: &str) -> Option<String> {
+    None
+}
+
 /// Semantic equality: compares the ordered name lists, so `One("X")` and
 /// `Many(["X"])` (the shape serde produces for `["X"]`) compare equal.
 impl PartialEq for EnvKeys {
@@ -1153,6 +1206,17 @@ pub struct WorktreePoolConfig {
 pub struct WorktreeConfigSection {
     #[serde(default)]
     pub auto_gc: crate::util::config::WorktreeAutoGcSettings,
+    /// Isolation backend for subagents: `"cow"` (git worktree + ignored CoW),
+    /// `"rift"` (anomaly `rift create --copy-all`), or `"git"` (plain worktree).
+    #[serde(default)]
+    pub isolation_backend: Option<String>,
+    /// Copy gitignored artifacts (node_modules, etc.) into isolated worktrees.
+    /// Default true when unset at the subagent create site.
+    #[serde(default)]
+    pub copy_ignored: Option<bool>,
+    /// After isolate, install JS deps only if the lockfile fingerprint changed.
+    #[serde(default)]
+    pub ensure_js_deps: Option<bool>,
 }
 /// `[sandbox]` section from config.toml.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1273,6 +1337,34 @@ pub struct ShellEnvironmentPolicyKnownKeys {
     pub set: Option<toml::Value>,
     pub include_only: Option<toml::Value>,
 }
+/// `[subagent_fanout]` section: provider-pool failover for sub-agents whose
+/// resolved model is the fanout default (the ox-alpha family). When enabled,
+/// every credentialed pool entry becomes a failover endpoint on the child's
+/// sampler config; spawn-time rotation spreads concurrent sub-agents across
+/// the pool's starting index.
+///
+/// ```toml
+/// [subagent_fanout]
+/// enabled = true
+/// default_model = "ox-alpha"
+/// pool = ["ox-alpha", "ox-alpha-zen", "ox-alpha-kilo"]
+/// ```
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SubagentFanoutConfig {
+    /// Master switch. Default `false` — ships dark.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Catalog id of the model family fanout applies to. `None` disables
+    /// application even when `enabled` (nothing to match against).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<String>,
+    /// Ordered catalog ids tried in turn when the active endpoint fails.
+    /// The first entry is the preferred start; spawn rotation reorders per
+    /// sub-agent. Entries must name `[model.*]` ids (validated with a warning).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pool: Vec<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     pub features: Features,
@@ -1369,6 +1461,11 @@ pub struct Config {
     pub disabled_mcp_tools: std::collections::HashMap<String, Vec<String>>,
     #[serde(default, skip_serializing)]
     pub subagents: crate::config::SubagentsConfig,
+    /// `[subagent_fanout]` section: sub-agent provider-pool failover. Parsed
+    /// leniently out-of-band by `parse_subagent_fanout`; validated against the
+    /// `[model.*]` catalog by `validate_subagent_fanout`.
+    #[serde(skip)]
+    pub subagent_fanout: Option<SubagentFanoutConfig>,
     #[serde(default, skip_serializing)]
     pub memory: crate::config::MemoryConfig,
     #[serde(default, skip_serializing)]
@@ -1769,6 +1866,7 @@ impl Default for Config {
             disabled_mcp_servers: Vec::new(),
             disabled_mcp_tools: std::collections::HashMap::new(),
             subagents: crate::config::SubagentsConfig::default(),
+            subagent_fanout: None,
             memory: crate::config::MemoryConfig::default(),
             compaction: CompactionConfig::default(),
             managed_mcps: crate::config::ManagedMcpsConfig::default(),
@@ -1907,6 +2005,38 @@ fn parse_auth_providers(
     }
     (providers, warnings)
 }
+/// Validate `[subagent_fanout]` against the parsed `[model.*]` catalog:
+/// every pool id must name a known model, else an `InvalidValue` warning
+/// names the missing id. Runs after `parse_model_overrides` so the full
+/// override set is visible. Pure warning emission — the config is never
+/// rejected.
+fn validate_subagent_fanout(
+    fanout: Option<&SubagentFanoutConfig>,
+    config_models: &IndexMap<String, ConfigModelOverride>,
+    warnings: &mut Vec<super::config_model_override_parse::ConfigWarning>,
+) {
+    use super::config_model_override_parse::{ConfigWarning, ConfigWarningKind};
+    let Some(fanout) = fanout else {
+        return;
+    };
+    if !fanout.enabled && fanout.pool.is_empty() {
+        // Nothing to validate on the default-dark shape.
+        return;
+    }
+    for id in &fanout.pool {
+        if !config_models.contains_key(id) {
+            warnings.push(ConfigWarning::config_key(
+                format!("subagent_fanout.pool.{id}"),
+                ConfigWarningKind::InvalidValue,
+                format!(
+                    "references [model.{id}], which is not defined; \
+                     the id is dropped from the failover pool"
+                ),
+            ));
+        }
+    }
+}
+
 impl Config {
     /// Reject invalid glob patterns in the model-filter lists at config load, so
     /// a typo fails loudly instead of silently changing availability.
@@ -1997,7 +2127,12 @@ impl Config {
             t.remove("model");
             t.remove("auth_provider");
             t.remove("model_providers");
+            // Out-of-band lenient parse below; a typed field here would
+            // double-warn via the unrecognized-key scan.
+            t.remove("subagent_fanout");
         }
+        let (subagent_fanout, mut subagent_fanout_warnings) =
+            crate::agent::model_providers::parse_subagent_fanout(raw_config);
         let parsed_mcp_servers =
             crate::util::config::parse_mcp_servers_from_toml(&raw_without_model_sections);
         if let toml::Value::Table(ref mut t) = raw_without_model_sections {
@@ -2014,8 +2149,17 @@ impl Config {
         config.config_warnings = config_warnings;
         config.auth_providers = auth_providers;
         config.model_providers = model_providers;
+        config.subagent_fanout = subagent_fanout.clone();
         config.config_warnings.extend(auth_provider_warnings);
         config.config_warnings.extend(model_provider_warnings);
+        config
+            .config_warnings
+            .extend(subagent_fanout_warnings.clone());
+        validate_subagent_fanout(
+            subagent_fanout.as_ref(),
+            &config.config_models,
+            &mut config.config_warnings,
+        );
         unrecognized_keys.sort();
         for key in unrecognized_keys {
             config.config_warnings.push(
@@ -5559,6 +5703,7 @@ pub(crate) fn sampling_config_for_model(
         compaction_at_tokens: info.compaction_at_tokens,
         doom_loop_recovery: None,
         header_injector,
+        failover_pool: None,
     }
 }
 /// Fold URL-derived headers into `extra_headers`.

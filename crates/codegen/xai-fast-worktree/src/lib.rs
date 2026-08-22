@@ -19,6 +19,7 @@ pub mod db;
 #[cfg(feature = "metadata")]
 pub mod discovery;
 mod git;
+mod js_deps;
 #[cfg(target_os = "linux")]
 pub(crate) mod mount_info;
 #[cfg(target_os = "linux")]
@@ -36,6 +37,10 @@ pub use api::cleanup_orphaned_overlay_snapshots;
 pub use api::gc::effective_max_age;
 #[cfg(feature = "metadata")]
 pub use api::gc::{GcOptions, GcReport, gc_worktrees, gc_worktrees_with_delegate};
+pub use js_deps::{
+    EnsureJsDepsOutcome, JsPackageManager, detect_js_package_manager, ensure_js_deps,
+    js_deps_fingerprint,
+};
 pub use api::{
     BtrfsDelegate, BtrfsMode, CleanupReport, CopyReport, CreationMode, DelegateSnapshotResult,
     DirtyFilesReport, ENOSPC_OS_MESSAGE, IgnoredFilesMode, OUT_OF_DISK_CONTEXT, RemoveReport,

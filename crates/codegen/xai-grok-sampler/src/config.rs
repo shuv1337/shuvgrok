@@ -53,6 +53,29 @@ pub enum WireIdentity {
 /// `SamplerConfig` is handed to the actor. Auth is selected separately
 /// via `auth_scheme`, while `api_backend` controls only the request/response
 /// protocol shape.
+/// One alternate endpoint that serves the same logical model.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct FailoverEndpoint {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub auth_scheme: AuthScheme,
+    #[serde(default)]
+    pub api_backend: ApiBackend,
+    #[serde(default)]
+    pub extra_headers: IndexMap<String, String>,
+    #[serde(default)]
+    pub query_params: IndexMap<String, String>,
+}
+
+/// Ordered failover pool for the same logical model across providers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq)]
+pub struct FailoverPool {
+    pub endpoints: Vec<FailoverEndpoint>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SamplerConfig {
     pub api_key: Option<String>,
@@ -146,6 +169,11 @@ pub struct SamplerConfig {
     /// Per-request header injector (e.g. OTel traceparent). Called in `post()`.
     #[serde(skip)]
     pub header_injector: Option<SharedHeaderInjector>,
+
+    /// Ordered alternate endpoints for the same logical model. `None`
+    /// (default) keeps the single-provider retry behavior unchanged.
+    #[serde(default)]
+    pub failover_pool: Option<FailoverPool>,
 }
 
 impl Default for SamplerConfig {
@@ -185,6 +213,7 @@ impl Default for SamplerConfig {
             compaction_at_tokens: None,
             doom_loop_recovery: None,
             header_injector: None,
+            failover_pool: None,
         }
     }
 }
@@ -273,5 +302,48 @@ mod tests {
             round_tripped.doom_loop_recovery,
             with_policy.doom_loop_recovery
         );
+    }
+
+    #[test]
+    fn failover_pool_serde_round_trip() {
+        let config = SamplerConfig {
+            failover_pool: Some(FailoverPool {
+                endpoints: vec![
+                    FailoverEndpoint {
+                        base_url: "https://alt1.example.com/v1".into(),
+                        model: "grok-4".into(),
+                        api_key: Some("k2".into()),
+                        auth_scheme: AuthScheme::XApiKey,
+                        api_backend: ApiBackend::Messages,
+                        extra_headers: IndexMap::from([("x-proxy-auth".into(), "tok".into())]),
+                        query_params: IndexMap::from([("api-version".into(), "2024".into())]),
+                    },
+                    FailoverEndpoint {
+                        // Every field defaulted.
+                        base_url: "https://alt2.example.com/v1".into(),
+                        model: "grok-4-backup".into(),
+                        api_key: None,
+                        auth_scheme: AuthScheme::default(),
+                        api_backend: ApiBackend::default(),
+                        extra_headers: IndexMap::new(),
+                        query_params: IndexMap::new(),
+                    },
+                ],
+            }),
+            ..Default::default()
+        };
+        let round_tripped: SamplerConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(round_tripped.failover_pool, config.failover_pool);
+    }
+
+    /// A payload from before the field existed must keep deserializing,
+    /// defaulting to no pool (legacy retry behavior).
+    #[test]
+    fn config_without_failover_pool_deserializes_to_none() {
+        let mut stripped = serde_json::to_value(SamplerConfig::default()).unwrap();
+        stripped.as_object_mut().unwrap().remove("failover_pool");
+        let config: SamplerConfig = serde_json::from_value(stripped).unwrap();
+        assert!(config.failover_pool.is_none());
     }
 }

@@ -124,6 +124,18 @@ pub enum SamplingEvent {
         reason: StripReason,
     },
 
+    /// Sampling moved to a failover-pool endpoint after the previous
+    /// endpoint failed with a retryable error. Emitted just before the
+    /// retried attempt starts; subsequent events come from the new
+    /// provider until the turn completes or fails over again.
+    ProviderFailedOver {
+        request_id: RequestId,
+        from_base_url: String,
+        to_base_url: String,
+        to_model: String,
+        reason: String,
+    },
+
     /// Request is being retried.
     Retrying {
         request_id: RequestId,

@@ -6,10 +6,219 @@
 //! auth, registry client, storage client, session restore).
 use crate::util::config::WorktreeType as ShellWorktreeType;
 use anyhow::{Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use xai_grok_workspace::session::git::find_git_root_from_path;
 pub use xai_grok_workspace::worktree::*;
 const WORKTREE_LOG: &str = "xai_worktree";
+
+/// How isolated subagent trees are created.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IsolationBackend {
+    #[default]
+    Cow,
+    Rift,
+    Git,
+}
+
+impl IsolationBackend {
+    /// Parse a config/env backend name. `None` if the value is empty or unknown.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "rift" | "copy-all" | "copy_all" => Some(Self::Rift),
+            "git" => Some(Self::Git),
+            "cow" | "worktree" => Some(Self::Cow),
+            _ => None,
+        }
+    }
+
+    pub fn from_config_and_mode(
+        configured: Option<&str>,
+        isolation: xai_tool_types::SubagentIsolationMode,
+    ) -> Self {
+        if isolation == xai_tool_types::SubagentIsolationMode::Rift {
+            return Self::Rift;
+        }
+        let env_backend = std::env::var("GROK_ISOLATION_BACKEND").ok();
+        configured
+            .and_then(Self::parse)
+            .or_else(|| env_backend.as_deref().and_then(Self::parse))
+            .unwrap_or(Self::Cow)
+    }
+}
+
+#[cfg(test)]
+mod isolation_backend_tests {
+    use super::IsolationBackend;
+    use xai_tool_types::SubagentIsolationMode;
+
+    #[test]
+    fn parse_aliases() {
+        assert_eq!(
+            IsolationBackend::parse("rift"),
+            Some(IsolationBackend::Rift)
+        );
+        assert_eq!(
+            IsolationBackend::parse("copy-all"),
+            Some(IsolationBackend::Rift)
+        );
+        assert_eq!(IsolationBackend::parse("GIT"), Some(IsolationBackend::Git));
+        assert_eq!(
+            IsolationBackend::parse("worktree"),
+            Some(IsolationBackend::Cow)
+        );
+        assert_eq!(IsolationBackend::parse("cow"), Some(IsolationBackend::Cow));
+        assert_eq!(IsolationBackend::parse("nope"), None);
+        assert_eq!(IsolationBackend::parse("  "), None);
+    }
+
+    #[test]
+    fn rift_mode_wins_over_config() {
+        assert_eq!(
+            IsolationBackend::from_config_and_mode(Some("cow"), SubagentIsolationMode::Rift),
+            IsolationBackend::Rift
+        );
+    }
+
+    #[test]
+    fn worktree_mode_uses_configured_backend() {
+        assert_eq!(
+            IsolationBackend::from_config_and_mode(Some("rift"), SubagentIsolationMode::Worktree),
+            IsolationBackend::Rift
+        );
+        assert_eq!(
+            IsolationBackend::from_config_and_mode(Some("git"), SubagentIsolationMode::Worktree),
+            IsolationBackend::Git
+        );
+    }
+}
+
+/// Create an isolated workspace for a subagent.
+///
+/// Uses the git root of `source`, not a nested session cwd. Copies gitignored
+/// deps (node_modules) unless disabled. Prefer anomaly rift `--copy-all` when
+/// requested; fall back to CoW worktree + ignored copy.
+pub fn create_subagent_isolation(
+    source: &Path,
+    dest: &Path,
+    session_id: &str,
+    backend: IsolationBackend,
+    copy_ignored: bool,
+    ensure_js_deps: bool,
+    creation_mode: xai_fast_worktree::CreationMode,
+    btrfs_delegate: Option<std::sync::Arc<dyn xai_fast_worktree::BtrfsDelegate>>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let path = match backend {
+        IsolationBackend::Rift => match try_rift_copy_all(source, dest) {
+            Ok(path) => path,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "rift isolate failed; falling back to CoW worktree + ignored copy"
+                );
+                create_cow_isolation(
+                    source,
+                    dest,
+                    session_id,
+                    true,
+                    creation_mode,
+                    btrfs_delegate,
+                )?
+            }
+        },
+        IsolationBackend::Git | IsolationBackend::Cow => create_cow_isolation(
+            source,
+            dest,
+            session_id,
+            copy_ignored || matches!(backend, IsolationBackend::Cow),
+            creation_mode,
+            btrfs_delegate,
+        )?,
+    };
+    if ensure_js_deps {
+        match xai_fast_worktree::ensure_js_deps(&path) {
+            Ok(outcome) => tracing::info!(?outcome, path = %path.display(), "js deps ensured"),
+            Err(error) => tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "js deps ensure failed; workspace still usable"
+            ),
+        }
+    }
+    Ok(path)
+}
+
+fn create_cow_isolation(
+    source: &Path,
+    dest: &Path,
+    session_id: &str,
+    copy_ignored: bool,
+    creation_mode: xai_fast_worktree::CreationMode,
+    btrfs_delegate: Option<std::sync::Arc<dyn xai_fast_worktree::BtrfsDelegate>>,
+) -> anyhow::Result<std::path::PathBuf> {
+    let ignored = if copy_ignored {
+        xai_fast_worktree::IgnoredFilesMode::Copy {
+            skip_patterns: vec![
+                ".turbo/**".into(),
+                "**/coverage/**".into(),
+                ".tmp/**".into(),
+            ],
+        }
+    } else {
+        xai_fast_worktree::IgnoredFilesMode::Skip
+    };
+    let mut builder = xai_fast_worktree::WorktreeBuilder::new(source, dest)
+        .working_tree_mode(xai_fast_worktree::WorkingTreeMode::PreserveWorkingTree)
+        .ignored_files_mode(ignored)
+        .creation_mode(creation_mode)
+        .worktree_kind(xai_fast_worktree::WorktreeKind::Subagent)
+        .session_id(session_id.to_owned());
+    if let Some(delegate) = btrfs_delegate {
+        builder = builder.btrfs_delegate(delegate);
+    }
+    Ok(builder.create()?.worktree_path)
+}
+
+fn try_rift_copy_all(source: &Path, dest: &Path) -> anyhow::Result<std::path::PathBuf> {
+    let into = dest
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("isolation dest has no parent"))?;
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| anyhow::anyhow!("isolation dest name is not UTF-8"))?;
+    let _ = std::process::Command::new("rift")
+        .args(["init", "--here"])
+        .current_dir(source)
+        .output();
+    std::fs::create_dir_all(into)?;
+    let output = std::process::Command::new("rift")
+        .args([
+            "create",
+            "--name",
+            name,
+            "--into",
+            &into.to_string_lossy(),
+            "--copy-all",
+            "--no-hooks",
+        ])
+        .current_dir(source)
+        .output()
+        .context("rift is not installed; `bun add -g rift-snapshot`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "rift create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let printed = String::from_utf8_lossy(&output.stdout);
+    let path = printed
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::trim)
+        .ok_or_else(|| anyhow::anyhow!("rift create printed no path"))?;
+    Ok(PathBuf::from(path))
+}
 impl From<ShellWorktreeType> for WorktreeType {
     fn from(t: ShellWorktreeType) -> Self {
         match t {

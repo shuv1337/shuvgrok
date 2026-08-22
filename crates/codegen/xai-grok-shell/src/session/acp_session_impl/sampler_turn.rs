@@ -580,7 +580,70 @@ impl SessionActor {
             compaction_at_tokens: self.compaction_at_tokens.get(),
             doom_loop_recovery: self.doom_loop_recovery,
             header_injector: Some(std::sync::Arc::new(TraceContextInjector)),
+            failover_pool: self.session_failover_pool().await,
         }
+    }
+    /// `[subagent_fanout]` failover pool for the MAIN session turn path.
+    ///
+    /// Mirrors the sub-agent routing in `agent::subagent::apply_subagent_fanout`
+    /// minus spawn rotation: when fanout is enabled and the ACTIVE session
+    /// model is the fanout default, the first credentialed pool entry becomes
+    /// the active provider and the rest ride `failover_pool` for the sampler's
+    /// `FailoverState` to walk on 429/retryable failures. Entries without a
+    /// resolvable own credential are excluded ("provably configured" gate);
+    /// the pool is `None` when disabled, unmatched, or single-entry, so
+    /// non-fanout models behave exactly as before.
+    async fn session_failover_pool(&self) -> Option<xai_grok_sampler::config::FailoverPool> {
+        let fanout = {
+            let cfg = crate::config::load_effective_config().ok()?;
+            crate::agent::subagent::SubagentFanoutRuntime::from_config(
+                crate::agent::model_providers::parse_subagent_fanout(&cfg)
+                    .0
+                    .as_ref(),
+            )?
+        };
+        let session_model = self.chat_state_handle.get_sampling_config().await?.model;
+        let models = self.models_manager.models();
+        // `default_model` names a user-facing catalog id (`[model.<id>]`),
+        // while the live sampling config carries the raw routing slug. Match
+        // the slug against the default's catalog entry (id or slug), falling
+        // back to a direct id match for entries whose key IS the slug.
+        let matched = session_model == fanout.default_model
+            || crate::agent::config::find_model_by_id(&models, &fanout.default_model)
+                .is_some_and(|entry| entry.info().model == session_model);
+        if !matched {
+            return None;
+        }
+        let session_key = self
+            .auth_manager
+            .as_ref()
+            .and_then(|am| am.current_or_expired().map(|a| a.key.clone()));
+        let mut endpoints = Vec::new();
+        for id in &fanout.pool {
+            let Some(entry) = crate::agent::config::find_model_by_id(&models, id) else {
+                continue;
+            };
+            if entry.own_credential().is_none() {
+                continue;
+            }
+            let credentials = crate::agent::config::resolve_credentials(entry, session_key.as_deref());
+            endpoints.push(crate::agent::subagent::failover_endpoint_for(
+                entry,
+                &credentials,
+            ));
+        }
+        if endpoints.len() < 2 {
+            return None;
+        }
+        xai_grok_telemetry::unified_log::debug(
+            "session fanout pool built",
+            Some(self.session_info.id.0.as_ref()),
+            Some(serde_json::json!({
+                "matched_model": session_model,
+                "endpoints": endpoints.len(),
+            })),
+        );
+        Some(xai_grok_sampler::config::FailoverPool { endpoints })
     }
     /// Install auto-mode permission classifier with a live LLM side-query
     /// (laziness-classifier pattern: `prepare_chat_completion` +

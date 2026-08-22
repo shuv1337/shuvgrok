@@ -180,6 +180,14 @@ fn sky_desktop_tools() -> Vec<ToolConfig> {
         (&grok_build::SelectTextTool).into(),
         (&grok_build::SetValueTool).into(),
         (&grok_build::TypeTextTool).into(),
+        (&grok_build::BrowsersListTool).into(),
+        (&grok_build::TabsListTool).into(),
+        (&grok_build::PageGotoTool).into(),
+        (&grok_build::PageScreenshotTool).into(),
+        (&grok_build::PageClickTool).into(),
+        (&grok_build::PageTypeTool).into(),
+        (&grok_build::PageContentTool).into(),
+        (&grok_build::PageCloseTool).into(),
     ]
 }
 
@@ -187,6 +195,10 @@ fn sky_desktop_read_tools() -> Vec<ToolConfig> {
     vec![
         (&grok_build::ListAppsTool).into(),
         (&grok_build::GetAppStateTool).into(),
+        (&grok_build::BrowsersListTool).into(),
+        (&grok_build::TabsListTool).into(),
+        (&grok_build::PageScreenshotTool).into(),
+        (&grok_build::PageContentTool).into(),
     ]
 }
 /// Complete workspace-executable toolset for hub registration.
@@ -2448,6 +2460,8 @@ description: Test default tool config
             "GrokBuild:get_app_state",
             "GrokBuild:click",
             "GrokBuild:type_text",
+            "GrokBuild:page_goto",
+            "GrokBuild:page_screenshot",
         ] {
             assert!(
                 def.tool_config.tools.iter().any(|tc| tc.id == id),

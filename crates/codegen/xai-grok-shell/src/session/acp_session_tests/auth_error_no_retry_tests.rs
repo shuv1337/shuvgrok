@@ -1164,6 +1164,7 @@ async fn set_session_model_invalidates_byok_memo_for_same_model_id() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                failover_pool: None,
                 wire_identity: Default::default(),
                 system_prompt_as_instructions: false,
             };
@@ -1260,6 +1261,7 @@ async fn switch_to_first_party_model_drops_minted_provider_token() {
                 compaction_at_tokens: None,
                 doom_loop_recovery: None,
                 header_injector: None,
+                failover_pool: None,
                 wire_identity: Default::default(),
                 system_prompt_as_instructions: false,
             };

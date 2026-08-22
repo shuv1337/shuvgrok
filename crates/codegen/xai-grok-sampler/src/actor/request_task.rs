@@ -23,8 +23,9 @@ use xai_grok_sampling_types::{
 };
 
 use crate::client::{ApiBackend, SamplingClient};
-use crate::config::{RetryPolicy, SamplerConfig};
+use crate::config::{FailoverEndpoint, RetryPolicy, SamplerConfig};
 use crate::events::{SamplingErrorInfo, SamplingErrorKind, SamplingEvent, StripReason};
+use crate::failover::FailoverState;
 use crate::metrics::InferenceLatencyStats;
 use crate::retry::{
     self as retry_mod, RetryDecision, classify_error, clone_error, resolve_max_retries,
@@ -38,6 +39,11 @@ use crate::types::RequestId;
 /// (5 minutes -- long enough for cold-start reasoning, short enough
 /// to detect dead streams before the user gives up).
 const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Tiny pause before the post-failover attempt: long enough to de-sync
+/// from the just-failed connection, far below the normal backoff curve.
+/// [`jittered_failover_delay`] adds ±30ms around this base.
+const FAILOVER_JITTER_DELAY_MS: u64 = 150;
 
 /// Result type for the `submit_and_collect` oneshot. Carries the rich
 /// `SamplingError` so callers can inspect retryability, status code,
@@ -124,6 +130,11 @@ pub(crate) async fn run_request_task(
 
     let mut request = request;
     let mut retry_count: u32 = 0;
+    // Failover pool state. `None` (no pool configured) keeps the retry
+    // path byte-for-byte identical to the single-provider behavior.
+    let mut failover = config.failover_pool.as_ref().map(FailoverState::new);
+    let mut active_config = config.clone();
+    let mut pool_attempt: u32 = 0;
     // Doom-loop recovery keeps its own resample budget, independent of the
     // transport/empty budget above.
     let doom_policy = (max_retries > 0)
@@ -167,6 +178,9 @@ pub(crate) async fn run_request_task(
                 response,
                 mut metrics,
             } => {
+                if let Some(failover) = failover.as_mut() {
+                    failover.mark_active_success();
+                }
                 metrics.attempts = retry_count + doom_retry_count + 1;
                 if let Some(policy) = doom_policy {
                     let confident = policy.confident_triggers(&response.doom_loop_signals);
@@ -223,6 +237,9 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &mut active_config,
+                    failover.as_mut(),
+                    &mut pool_attempt,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -276,6 +293,9 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &mut active_config,
+                    failover.as_mut(),
+                    &mut pool_attempt,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -299,6 +319,9 @@ pub(crate) async fn run_request_task(
                     &mut request,
                     &mut client,
                     &config,
+                    &mut active_config,
+                    failover.as_mut(),
+                    &mut pool_attempt,
                     &cancel_token,
                     &mut completion_tx,
                 )
@@ -316,7 +339,13 @@ pub(crate) async fn run_request_task(
 /// emit-to-session). Performs the side-effects of the decision:
 /// sleeping, rebuilding the client, stripping images, emitting the
 /// `Retrying` event.
+///
+/// Failover hijack: when a pool is configured and the error is the kind
+/// `classify_error` would retry anyway, this tries to move to the next
+/// healthy pool endpoint instead of sleeping out the backoff. Pool
+/// exhaustion defers to the legacy sleep/backoff path unchanged.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::ref_option)]
 async fn apply_retry_decision(
     err: &SamplingError,
     retry_count: &mut u32,
@@ -326,7 +355,10 @@ async fn apply_retry_decision(
     request_id: &RequestId,
     request: &mut ConversationRequest,
     client: &mut SamplingClient,
-    config: &SamplerConfig,
+    base_config: &SamplerConfig,
+    active_config: &mut SamplerConfig,
+    failover: Option<&mut FailoverState>,
+    pool_attempt: &mut u32,
     cancel_token: &CancellationToken,
     completion_tx: &mut Option<oneshot::Sender<CompletionResult>>,
 ) -> bool {
@@ -336,6 +368,38 @@ async fn apply_retry_decision(
         retry_policy.rate_limit_retry_threshold
     };
     let decision = classify_error(err, *retry_count, max_retries, rate_limit_threshold);
+
+    // Failover hijack. Only for errors the classifier would retry — the
+    // same veto/auth/strip guards above apply, so 401s, x-should-retry:
+    // false, image-strip cases, and budget-exhausted Fatals never move
+    // the pool. With no pool configured this arm is skipped entirely and
+    // every branch below behaves exactly as before.
+    let retriable_decision = matches!(
+        decision,
+        RetryDecision::Retry { .. }
+            | RetryDecision::RetryWithBackoff { .. }
+            | RetryDecision::RetryWithClientRebuild { .. }
+    );
+    if retriable_decision
+        && crate::failover::qualifies_for_failover(err)
+        && let Some(failover) = failover
+        && try_failover(
+            err,
+            failover,
+            pool_attempt,
+            base_config,
+            active_config,
+            client,
+            event_tx,
+            request_id,
+            cancel_token,
+        )
+        .await
+    {
+        return true;
+    }
+    // No healthy candidate, no pool configured, or a non-retriable error:
+    // fall through to the legacy path below.
 
     // Connection-reset / broken-pipe on body upload often means nginx
     // rejected an oversized payload before responding 413. Strip
@@ -442,7 +506,7 @@ async fn apply_retry_decision(
 
             // Rebuild client with HTTP/1.1 fallback to escape poisoned
             // HTTP/2 connection pools.
-            let mut http1_config = config.clone();
+            let mut http1_config = active_config.clone();
             http1_config.force_http1 = true;
             match SamplingClient::new(http1_config) {
                 Ok(fresh) => {
@@ -480,7 +544,7 @@ async fn apply_retry_decision(
                 let exhausted_span = tracing::info_span!(
                     "http.retries_exhausted",
                     total_attempts = next_attempt as i64,
-                    model = %config.model,
+                    model = %active_config.model,
                     error = %err,
                     status_code = tracing::field::Empty,
                 );
@@ -499,6 +563,275 @@ async fn apply_retry_decision(
             false
         }
     }
+}
+
+/// Attempt one failover hop to the next healthy pool endpoint.
+///
+/// Marks the currently active endpoint failed, picks the next candidate
+/// that is not cooling down, liveness-probes it (`GET /models`, 1.5s
+/// timeout; 401/403 counts as reachable-but-unauthorized and only wins
+/// when no other candidate passes), rebuilds the client from the
+/// endpoint's config, emits [`SamplingEvent::ProviderFailedOver`], waits
+/// a tiny jittered delay, and reports success. Returns `false` when the
+/// pool is exhausted (every candidate tried or cooling) so the caller
+/// defers to the legacy retry behavior.
+#[allow(clippy::too_many_arguments)]
+async fn try_failover(
+    err: &SamplingError,
+    failover: &mut FailoverState,
+    pool_attempt: &mut u32,
+    base_config: &SamplerConfig,
+    active_config: &mut SamplerConfig,
+    client: &mut SamplingClient,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    request_id: &RequestId,
+    cancel_token: &CancellationToken,
+) -> bool {
+    let from_base_url = active_config.base_url.clone();
+    failover.mark_active_failed(err.is_rate_limited());
+
+    // Walk candidates until one passes the probe. A probe failure marks
+    // that endpoint failed so later rotations skip it too.
+    while let Some(idx) = failover.next_healthy() {
+        let Some(endpoint) = base_config
+            .failover_pool
+            .as_ref()
+            .and_then(|pool| pool.endpoints.get(idx))
+        else {
+            break;
+        };
+        match FailoverState::probe_endpoint(endpoint).await {
+            crate::failover::ProbeOutcome::Ok => {
+                commit_failover(
+                    idx,
+                    endpoint,
+                    failover,
+                    pool_attempt,
+                    active_config,
+                    client,
+                    event_tx,
+                    request_id,
+                    &from_base_url,
+                    err,
+                    cancel_token,
+                )
+                .await;
+                return true;
+            }
+            crate::failover::ProbeOutcome::ReachableButUnauthorized => {
+                // Keep as fallback: note it and look for a fully passing
+                // candidate first.
+                if !try_unauthorized_fallback(
+                    idx,
+                    endpoint,
+                    failover,
+                    pool_attempt,
+                    active_config,
+                    client,
+                    event_tx,
+                    request_id,
+                    &from_base_url,
+                    err,
+                    cancel_token,
+                )
+                .await
+                {
+                    // Nothing else passed either; commit to this one.
+                    commit_failover(
+                        idx,
+                        endpoint,
+                        failover,
+                        pool_attempt,
+                        active_config,
+                        client,
+                        event_tx,
+                        request_id,
+                        &from_base_url,
+                        err,
+                        cancel_token,
+                    )
+                    .await;
+                }
+                return true;
+            }
+            crate::failover::ProbeOutcome::Unreachable => {
+                tracing::info!(
+                    target: crate::sampling_log::TARGET,
+                    pool_index = idx + 1,
+                    "failover probe failed; marking endpoint and trying next"
+                );
+                failover.set_active(idx);
+                failover.mark_active_failed(false);
+                continue;
+            }
+        }
+    }
+    tracing::warn!(
+        target: crate::sampling_log::TARGET,
+        pool_size = base_config.failover_pool.as_ref().map_or(0, |p| p.endpoints.len()),
+        any_in_cooldown = failover.any_in_cooldown(),
+        error = %err,
+        "failover pool exhausted; falling back to legacy retry on current provider"
+    );
+    false
+}
+
+/// Last-resort commit for a reachable-but-unauthorized probe result:
+/// scans the remaining candidates for a full pass; when none exists the
+/// caller commits to this endpoint anyway. Returns `true` if a fully
+/// passing candidate was found and committed instead.
+#[allow(clippy::too_many_arguments)]
+async fn try_unauthorized_fallback(
+    idx: usize,
+    endpoint: &FailoverEndpoint,
+    failover: &mut FailoverState,
+    pool_attempt: &mut u32,
+    active_config: &mut SamplerConfig,
+    client: &mut SamplingClient,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    request_id: &RequestId,
+    from_base_url: &str,
+    err: &SamplingError,
+    cancel_token: &CancellationToken,
+) -> bool {
+    let start = (idx + 1) % failover.pool_len();
+    let mut committed_elsewhere = None;
+    for offset in 0..failover.pool_len() {
+        let other = (start + offset) % failover.pool_len();
+        let Some(other_ep) = base_pool_endpoint(active_config, other) else {
+            continue;
+        };
+        match FailoverState::probe_endpoint(other_ep).await {
+            crate::failover::ProbeOutcome::Ok => {
+                committed_elsewhere = Some(other);
+                break;
+            }
+            _ => continue,
+        }
+    }
+    match committed_elsewhere {
+        Some(other) => {
+            let chosen = base_pool_endpoint(active_config, other)
+                .map(|ep| FailoverEndpoint {
+                    base_url: ep.base_url.clone(),
+                    model: ep.model.clone(),
+                    api_key: ep.api_key.clone(),
+                    auth_scheme: ep.auth_scheme,
+                    api_backend: ep.api_backend.clone(),
+                    extra_headers: ep.extra_headers.clone(),
+                    query_params: ep.query_params.clone(),
+                })
+                .unwrap_or_else(|| endpoint.clone());
+            commit_failover(
+                other,
+                &chosen,
+                failover,
+                pool_attempt,
+                active_config,
+                client,
+                event_tx,
+                request_id,
+                from_base_url,
+                err,
+                cancel_token,
+            )
+            .await;
+            true
+        }
+        None => false,
+    }
+}
+
+fn base_pool_endpoint<'a>(config: &'a SamplerConfig, idx: usize) -> Option<&'a FailoverEndpoint> {
+    config
+        .failover_pool
+        .as_ref()
+        .and_then(|pool| pool.endpoints.get(idx))
+}
+
+/// Build the per-endpoint [`SamplerConfig`] and swap in a fresh
+/// [`SamplingClient`], then emit the failover event and pause briefly.
+async fn commit_failover(
+    idx: usize,
+    endpoint: &FailoverEndpoint,
+    failover: &mut FailoverState,
+    pool_attempt: &mut u32,
+    active_config: &mut SamplerConfig,
+    client: &mut SamplingClient,
+    event_tx: &mpsc::UnboundedSender<SamplingEvent>,
+    request_id: &RequestId,
+    from_base_url: &str,
+    err: &SamplingError,
+    cancel_token: &CancellationToken,
+) {
+    *active_config = build_endpoint_config(base_config_of(endpoint, active_config), endpoint);
+    match SamplingClient::new(active_config.clone()) {
+        Ok(fresh) => {
+            *client = fresh;
+        }
+        Err(build_err) => {
+            tracing::error!(
+                error = %build_err,
+                pool_index = idx + 1,
+                "failed to build sampling client for failover endpoint"
+            );
+        }
+    }
+    failover.set_active(idx);
+    *pool_attempt += 1;
+    tracing::warn!(
+        target: crate::sampling_log::TARGET,
+        pool_index = idx + 1,
+        pool_attempt = *pool_attempt,
+        to_model = %endpoint.model,
+        error = %err,
+        "failing over to alternate provider endpoint"
+    );
+    let _ = event_tx.send(SamplingEvent::ProviderFailedOver {
+        request_id: request_id.clone(),
+        from_base_url: from_base_url.to_string(),
+        to_base_url: endpoint.base_url.clone(),
+        to_model: endpoint.model.clone(),
+        reason: err.to_string(),
+    });
+    sleep_or_cancel(jittered_failover_delay(), cancel_token).await;
+}
+
+/// The failover pool always rides on the primary config; the endpoint's
+/// own fields override it. Kept as a parameter pass-through for clarity.
+fn base_config_of<'a>(
+    _endpoint: &FailoverEndpoint,
+    active_config: &'a SamplerConfig,
+) -> &'a SamplerConfig {
+    active_config
+}
+
+fn build_endpoint_config(current: &SamplerConfig, endpoint: &FailoverEndpoint) -> SamplerConfig {
+    let mut cfg = current.clone();
+    cfg.base_url = endpoint.base_url.clone();
+    cfg.model = endpoint.model.clone();
+    cfg.api_key = endpoint.api_key.clone();
+    cfg.auth_scheme = endpoint.auth_scheme;
+    cfg.api_backend = endpoint.api_backend.clone();
+    cfg.extra_headers = endpoint.extra_headers.clone();
+    cfg.query_params = endpoint.query_params.clone();
+    cfg.force_http1 = false;
+    cfg
+}
+
+/// ~150ms ±20% jitter, de-syncing concurrent failovers without adding
+/// meaningful latency.
+fn jittered_failover_delay() -> Duration {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static JITTER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    JITTER_SEQ.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+    std::thread::current().id().hash(&mut hasher);
+    let jitter = hasher.finish() % 61; // ±30ms around 150ms
+    Duration::from_millis(FAILOVER_JITTER_DELAY_MS - 30 + jitter)
 }
 
 async fn sleep_or_cancel(duration: Duration, cancel_token: &CancellationToken) -> bool {
@@ -1089,7 +1422,7 @@ mod tests {
         let cancel_token = CancellationToken::new();
         cancel_token.cancel();
         let (event_tx, mut event_rx) = mpsc::unbounded_channel();
-        let (completion_tx, completion_rx) = oneshot::channel();
+        let (completion_tx, completion_rx) = oneshot::channel::<CompletionResult>();
         let mut completion_tx = Some(completion_tx);
         let mut retry_count = 0;
         let mut request = ConversationRequest::default();
@@ -1111,6 +1444,9 @@ mod tests {
             &mut request,
             &mut client,
             &config,
+            &mut config.clone(),
+            None,
+            &mut 0,
             &cancel_token,
             &mut completion_tx,
         )
