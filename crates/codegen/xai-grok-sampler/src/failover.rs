@@ -177,6 +177,17 @@ impl FailoverState {
         }
     }
 
+    /// Whether the active endpoint has hit [`FAILOVER_THRESHOLD`]
+    /// consecutive failures and the request should hop. The primary
+    /// (untracked, index `None`) is always over threshold: it has no
+    /// per-request history to accumulate a streak on.
+    pub fn threshold_reached_on_active(&self) -> bool {
+        match self.active {
+            Some(idx) => threshold_reached(self.health[idx].consecutive_failures),
+            None => true,
+        }
+    }
+
     /// Next healthy pool index rotating after `self.active`, skipping
     /// endpoints that are cooling down. Returns `None` when every
     /// candidate is exhausted (in cooldown or tried).
@@ -297,6 +308,19 @@ fn models_url(base_url: &str) -> String {
 /// cases, Fatals).
 pub(crate) fn qualifies_for_failover(err: &xai_grok_sampling_types::SamplingError) -> bool {
     err.is_rate_limited() || err.is_retryable()
+}
+
+/// Consecutive failures on the active endpoint before a request hops to the
+/// next pool entry. A single transient blip retries in-place — cheap and
+/// prompt-cache-warm; only repeated failures indicate the endpoint is
+/// actually degraded enough to justify the cache-breaking switch.
+pub(crate) const FAILOVER_THRESHOLD: u32 = 2;
+
+/// Whether the active endpoint has failed enough consecutive times to
+/// justify hopping. `consecutive` is the CURRENT streak including this
+/// latest failure.
+pub(crate) fn threshold_reached(consecutive: u32) -> bool {
+    consecutive >= FAILOVER_THRESHOLD
 }
 
 #[cfg(test)]

@@ -590,6 +590,21 @@ async fn try_failover(
     let from_base_url = active_config.base_url.clone();
     failover.mark_active_failed(err.is_rate_limited());
 
+    // Cache-preserving threshold: the FIRST failure on an endpoint retries
+    // in-place (cheap, prompt-cache-warm); only after
+    // [`crate::failover::FAILOVER_THRESHOLD`] consecutive failures does the
+    // request actually hop. `mark_active_failed` just recorded the streak,
+    // and the primary (index None) is exempt — it has no tracked history, so
+    // its first failure always evaluates the pool.
+    if !failover.threshold_reached_on_active() {
+        tracing::info!(
+            target: crate::sampling_log::TARGET,
+            threshold = crate::failover::FAILOVER_THRESHOLD,
+            "failover below threshold; retrying in-place to preserve cache"
+        );
+        return false;
+    }
+
     // Walk candidates until one passes the probe. A probe failure marks
     // that endpoint failed so later rotations skip it too.
     while let Some(idx) = failover.next_healthy() {
