@@ -332,6 +332,24 @@ jobs:
               --target "$(git rev-parse HEAD)"
           fi
 
+      # Floating pointer at the last successful publish. Kept in CI (not
+      # scripts/release.mjs) so a failed npm/GitHub publish cannot steal it.
+      # Lightweight, force-moved: git fetch origin tag latest.
+      - name: Point latest tag at this release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "Pointing refs/tags/latest at ${sha} (${RELEASE_TAG})"
+          if gh api "repos/${GH_REPO}/git/ref/tags/latest" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${GH_REPO}/git/refs/tags/latest" \
+              -f sha="${sha}" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${GH_REPO}/git/refs" \
+              -f ref="refs/tags/latest" -f sha="${sha}" >/dev/null
+          fi
+
   notify-discord:
     name: notify discord
     runs-on: ubuntu-latest

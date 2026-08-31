@@ -22,7 +22,9 @@ commits `Release vX.Y.Z`, tags, and pushes. Pushing the tag is what starts CI.
    packages *before* the meta package, which pins them by exact version.
    Authenticates by OIDC trusted publishing — there is no npm token.
 3. **publish-github-release** — `gh release create --generate-notes` against
-   the tag's commit SHA.
+   the tag's commit SHA, then force-moves the floating `latest` git tag onto
+   that commit. `latest` is updated here, not in `release.mjs`, so a failed
+   publish cannot steal it.
 4. **notify-discord** — posts the release to the shared webhook.
 
 ## One-time setup — done 2026-08-16

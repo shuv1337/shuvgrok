@@ -14,6 +14,7 @@
  *      including the meta package's exact optionalDependencies pins)
  *   4. cargo fmt --all --check, then cargo check --workspace (refreshes Cargo.lock)
  *   5. Commit, tag vX.Y.Z, push branch + tag
+ *      (CI force-moves the floating `latest` tag after a successful publish)
  *   6. Announce on Discord (best effort; skipped when the webhook is unset)
  *
  * The heavy lifting happens in CI: pushing the tag triggers
