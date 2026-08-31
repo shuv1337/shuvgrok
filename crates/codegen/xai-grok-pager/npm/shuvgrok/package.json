@@ -1,6 +1,6 @@
 {
     "name": "@shuv1337/shuvgrok",
-    "version": "1.0.6",
+    "version": "1.0.7",
     "description": "ShuvGrok: bring Grok into your terminal",
     "license": "Apache-2.0",
     "repository": {
@@ -35,11 +35,11 @@
         "@iarna/toml": "^3.0.0"
     },
     "optionalDependencies": {
-        "@shuv1337/shuvgrok-darwin-arm64": "1.0.6",
-        "@shuv1337/shuvgrok-darwin-x64": "1.0.6",
-        "@shuv1337/shuvgrok-linux-arm64": "1.0.6",
-        "@shuv1337/shuvgrok-linux-x64": "1.0.6",
-        "@shuv1337/shuvgrok-win32-arm64": "1.0.6",
-        "@shuv1337/shuvgrok-win32-x64": "1.0.6"
+        "@shuv1337/shuvgrok-darwin-arm64": "1.0.7",
+        "@shuv1337/shuvgrok-darwin-x64": "1.0.7",
+        "@shuv1337/shuvgrok-linux-arm64": "1.0.7",
+        "@shuv1337/shuvgrok-linux-x64": "1.0.7",
+        "@shuv1337/shuvgrok-win32-arm64": "1.0.7",
+        "@shuv1337/shuvgrok-win32-x64": "1.0.7"
     }
 }
