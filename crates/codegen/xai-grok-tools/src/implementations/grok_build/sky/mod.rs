@@ -133,7 +133,7 @@ pub(crate) fn sky_bin() -> Result<PathBuf, xai_tool_runtime::ToolError> {
     if let Ok(path) = which::which("sky") {
         return Ok(path);
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = xai_dirs::home_dir() {
         for rel in [
             "sky-re/bin/sky",
             "code/sky-re/bin/sky",
@@ -231,9 +231,7 @@ sky_tool!(
     "List local macOS apps targetable by Sky Computer Use (running/recent, canonical ids). Does not launch ChatGPT.",
     ToolKind::List,
     ListAppsInput,
-    |_input| {
-        sky("list_apps", serde_json::json!({})).await
-    }
+    |_input| { sky("list_apps", serde_json::json!({})).await }
 );
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -660,19 +658,34 @@ mod tests {
             xai_tool_runtime::Tool::id(&BrowsersListTool).as_str(),
             "browsers_list"
         );
-        assert_eq!(xai_tool_runtime::Tool::id(&TabsListTool).as_str(), "tabs_list");
-        assert_eq!(xai_tool_runtime::Tool::id(&PageGotoTool).as_str(), "page_goto");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&TabsListTool).as_str(),
+            "tabs_list"
+        );
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageGotoTool).as_str(),
+            "page_goto"
+        );
         assert_eq!(
             xai_tool_runtime::Tool::id(&PageScreenshotTool).as_str(),
             "page_screenshot"
         );
-        assert_eq!(xai_tool_runtime::Tool::id(&PageClickTool).as_str(), "page_click");
-        assert_eq!(xai_tool_runtime::Tool::id(&PageTypeTool).as_str(), "page_type");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageClickTool).as_str(),
+            "page_click"
+        );
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageTypeTool).as_str(),
+            "page_type"
+        );
         assert_eq!(
             xai_tool_runtime::Tool::id(&PageContentTool).as_str(),
             "page_content"
         );
-        assert_eq!(xai_tool_runtime::Tool::id(&PageCloseTool).as_str(), "page_close");
+        assert_eq!(
+            xai_tool_runtime::Tool::id(&PageCloseTool).as_str(),
+            "page_close"
+        );
     }
 
     #[test]

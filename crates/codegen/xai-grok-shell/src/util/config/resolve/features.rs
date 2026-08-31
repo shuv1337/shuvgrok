@@ -23,6 +23,38 @@ pub fn resolve_zdr_access_enabled(
         .value
 }
 
+/// Spawn-time kill switch: `[features] turn_transient_retry`,
+/// `GROK_TURN_TRANSIENT_RETRY`, remote key (below local), default on.
+/// Loads local layers itself; call once per session.
+pub(crate) fn turn_transient_retry_from_toml(v: Option<&TomlValue>) -> Option<bool> {
+    v?.get("features")?.get("turn_transient_retry")?.as_bool()
+}
+
+pub(crate) fn resolve_turn_transient_retry(remote: Option<bool>) -> bool {
+    let user_cfg = crate::config::load_effective_config().ok();
+    // Merged (user, system, MDM last-wins) like the sibling resolvers, so an
+    // enterprise pin is not silently dropped.
+    let requirements = crate::config::load_merged_requirements();
+    compose_turn_transient_retry(requirements.as_ref(), user_cfg.as_ref(), remote)
+}
+
+/// Pure composition, split from the disk loads so layer ordering is testable.
+fn compose_turn_transient_retry(
+    requirements: Option<&TomlValue>,
+    user: Option<&TomlValue>,
+    remote: Option<bool>,
+) -> bool {
+    use turn_transient_retry_from_toml as from_toml;
+    crate::agent::config::resolve_turn_transient_retry(
+        from_toml(requirements),
+        /* cli          */ None,
+        from_toml(user),
+        /* managed: merged into the config layer by load_effective_config */ None,
+        remote,
+    )
+    .value
+}
+
 /// Whether model-catalog (`/v1/models`) and remote-settings (`/v1/settings`)
 /// fetches from xAI backends are allowed, including the deployment-config sync
 /// bundled into the startup prefetch (the background managed-config sync has
@@ -30,8 +62,11 @@ pub fn resolve_zdr_access_enabled(
 ///
 /// Precedence: requirements (MDM > system > user) > managed
 /// (`managed_config.toml` > system managed) > user `config.toml` > default
-/// (true). Callable before an `AgentConfig` exists (startup prefetch runs
-/// pre-agent), so it re-reads the config layers like
+/// (true). Overlay-free: the `GROK_CONFIG` / `GROK_CONFIG_PATH` overlay is
+/// deliberately excluded (an egress gate, matching the overlay-free contract in
+/// `ConfigLayers::env_overlay`), so an overlay cannot re-arm a user's or a
+/// deployment's "never fetch" decision. Callable before an `AgentConfig` exists
+/// (startup prefetch runs pre-agent), so it re-reads the config layers like
 /// `managed_config::is_fetch_enabled`.
 ///
 /// Deliberately no env var and no remote tier: remote settings are exactly
@@ -55,6 +90,10 @@ pub fn resolve_remote_fetch_enabled() -> bool {
 
 pub const REMOTE_FETCH_CONFIG_PATH: &str = "features.remote_fetch";
 
+/// Keys whose dedicated resolver walks managed before user `config.toml`.
+/// The effective merge lets the user file win for every other key.
+pub const MANAGED_WINS_OVER_USER: &[&str] = &[REMOTE_FETCH_CONFIG_PATH];
+
 fn remote_fetch_value(v: &TomlValue) -> Option<bool> {
     v.get("features")?.get("remote_fetch")?.as_bool()
 }
@@ -66,14 +105,17 @@ fn remote_fetch_value(v: &TomlValue) -> Option<bool> {
 fn remote_fetch_enabled_from_layers(layers: &crate::config::ConfigLayers) -> bool {
     // Exhaustive destructure (no `..`): a future layer must be slotted into the
     // walk deliberately instead of silently keeping stale precedence.
-    // `campaigns` is deliberately NOT in the walk: campaign patches are soft,
-    // dismissable overlays applied after the layer merge — they must never
-    // arm/disarm a policy knob like remote_fetch (requirements are re-merged
-    // over campaigns for the same reason).
+    // `env_overlay` is deliberately NOT in the walk: the `GROK_CONFIG` overlay
+    // is soft, user-tier input, and this is an egress gate, so it must never
+    // arm/disarm remote_fetch (the overlay-free contract in
+    // `ConfigLayers::env_overlay`). `campaigns` is excluded for the same reason:
+    // campaign patches are soft, dismissable overlays applied after the layer
+    // merge, and requirements are re-merged over campaigns for the same reason.
     let crate::config::ConfigLayers {
         system_managed,
         managed,
         user,
+        env_overlay: _,
         user_requirements,
         system_requirements,
         mdm_requirements,
@@ -185,6 +227,18 @@ mod tests {
     }
 
     #[test]
+    fn remote_fetch_env_overlay_is_ignored_in_both_directions() {
+        let mut layers = empty_layers();
+        layers.user = features_remote_fetch(false);
+        layers.env_overlay = Some(features_remote_fetch(true));
+        assert!(!remote_fetch_enabled_from_layers(&layers));
+
+        let mut layers = empty_layers();
+        layers.env_overlay = Some(features_remote_fetch(false));
+        assert!(remote_fetch_enabled_from_layers(&layers));
+    }
+
+    #[test]
     fn remote_fetch_system_and_mdm_tiers_follow_the_walk() {
         // Within the managed tier: user-level managed_config.toml beats the
         // system managed layer (mirrors effective_config merge order), and
@@ -260,5 +314,47 @@ mod tests {
             remote_fetch_enabled_from_policy_layers(None, None, None),
             "genuinely absent policy fails open"
         );
+    }
+}
+
+#[cfg(test)]
+mod turn_transient_retry_toml_tests {
+    use super::turn_transient_retry_from_toml;
+
+    #[test]
+    fn composition_orders_requirements_over_config_over_remote() {
+        let t = |b: bool| -> toml::Value {
+            let mut f = toml::map::Map::new();
+            f.insert("turn_transient_retry".into(), toml::Value::Boolean(b));
+            let mut root = toml::map::Map::new();
+            root.insert("features".into(), toml::Value::Table(f));
+            toml::Value::Table(root)
+        };
+        // requirements beat user config; config beats remote; remote beats default.
+        assert!(!super::compose_turn_transient_retry(
+            Some(&t(false)),
+            Some(&t(true)),
+            None
+        ));
+        assert!(!super::compose_turn_transient_retry(
+            None,
+            Some(&t(false)),
+            Some(true)
+        ));
+        assert!(!super::compose_turn_transient_retry(
+            None,
+            None,
+            Some(false)
+        ));
+        assert!(super::compose_turn_transient_retry(None, None, None));
+    }
+
+    #[test]
+    fn reads_the_features_key_and_defaults_absent_to_none() {
+        let v: toml::Value = toml::toml! { [features] turn_transient_retry = false }.into();
+        assert_eq!(turn_transient_retry_from_toml(Some(&v)), Some(false));
+        let empty: toml::Value = toml::toml! { [features] }.into();
+        assert_eq!(turn_transient_retry_from_toml(Some(&empty)), None);
+        assert_eq!(turn_transient_retry_from_toml(None), None);
     }
 }

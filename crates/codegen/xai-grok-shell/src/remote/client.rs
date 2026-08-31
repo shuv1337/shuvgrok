@@ -1,4 +1,5 @@
 //! HTTP client for backend CRUD operations.
+use crate::auth::backend::{ActiveAuthBackend, AuthBackend};
 use crate::auth::{GrokAuth, GrokComConfig};
 use crate::session::export::{ExportedMessage, ExportedMetadata, ExportedSession};
 use indexmap::IndexMap;
@@ -53,8 +54,8 @@ async fn add_bundle_fetch_headers(
     url: &str,
 ) -> reqwest::RequestBuilder {
     let resolved_auth = match auth_manager {
-        Some(am) => am.auth().await.ok(),
-        None => None,
+        Some(am) if ActiveAuthBackend::default().is_xai_authority() => am.auth().await.ok(),
+        _ => None,
     };
     let mut credentials = crate::util::grok_auth_credentials::GrokAuthCredentials::new(
         resolved_auth.as_ref().map(|auth| auth.key.clone()),
@@ -290,12 +291,9 @@ impl Default for BackendClient {
 }
 impl BackendClient {
     fn build_default_client() -> reqwest::Client {
-        xai_grok_extra_ca::with_extra_root_certificates(
-                reqwest::Client::builder()
-                    .connect_timeout(Duration::from_secs(10))
-                    .timeout(DEFAULT_TIMEOUT),
-            )
-            .build()
+        xai_grok_extra_ca::build_reqwest_client(|builder| {
+                builder.connect_timeout(Duration::from_secs(10)).timeout(DEFAULT_TIMEOUT)
+            })
             .unwrap_or_else(|e| {
                 tracing::warn!(error = %e, "failed to build backend HTTP client; falling back to shared client");
                 crate::http::shared_client()
@@ -388,7 +386,7 @@ impl BackendClient {
         Ok(share_url(&share_response.permission_id))
     }
     /// Build auth + identity headers.
-    /// Must include X-XAI-Token-Auth so nginx auth subrequest routes to authenticate_xai_grok_cli_token.
+    /// Must include X-XAI-Token-Auth so nginx auth subrequest routes to OAuth.
     /// See: crates/codegen/xai-grok-shell/src/agent/app.rs:run_headless
     async fn auth_header_map(&self) -> Result<reqwest::header::HeaderMap, BackendError> {
         use reqwest::header::{HeaderMap, HeaderValue};
@@ -700,132 +698,9 @@ pub async fn fetch_login_device_flow(cli_chat_proxy_base_url: &str) -> Option<bo
 }
 /// Default context window (256k) when the remote endpoint doesn't provide one.
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u64 = 256_000;
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<serde_json::Value>,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EndpointAuth {
-    ApiKey,
-    Session,
-}
-struct ListModelsEndpoint {
-    url: String,
-    auth: EndpointAuth,
-}
-/// The `/v1/models` URL [`fetch_models_blocking`] hits for this
-/// endpoints/auth shape. Doubles as the models disk-cache origin key: cached
-/// entries embed absolute `base_url`s from the backend that served them, so a
-/// catalog fetched from one backend (env override, another deployment, a
-/// test's mock server) must be a cache miss for any other backend.
-pub(crate) fn models_list_url(
-    endpoints: &crate::agent::config::EndpointsConfig,
-    fetch_auth: crate::agent::models::ModelFetchAuth,
-) -> String {
-    ListModelsEndpoint::from_endpoints(endpoints, fetch_auth).url
-}
-impl ListModelsEndpoint {
-    fn from_endpoints(
-        endpoints: &crate::agent::config::EndpointsConfig,
-        fetch_auth: crate::agent::models::ModelFetchAuth,
-    ) -> Self {
-        if endpoints.has_custom_endpoint() {
-            Self {
-                url: endpoints.resolve_models_list_url(),
-                auth: EndpointAuth::ApiKey,
-            }
-        } else if fetch_auth == crate::agent::models::ModelFetchAuth::ApiKey {
-            Self {
-                url: format!("{}/models", endpoints.xai_api_base_url),
-                auth: EndpointAuth::ApiKey,
-            }
-        } else {
-            Self {
-                url: endpoints.resolve_models_list_url(),
-                auth: EndpointAuth::Session,
-            }
-        }
-    }
-}
-/// Fetch models from an OpenAI-compatible `/v1/models` endpoint.
-/// Fetch result: model entries + optional etag from response.
 pub struct FetchModelsResult {
     pub models: Vec<crate::agent::config::ModelEntryConfig>,
     pub etag: Option<String>,
-}
-pub(crate) fn fetch_models_blocking(
-    endpoints: &crate::agent::config::EndpointsConfig,
-    auth: Option<&GrokAuth>,
-    fetch_auth: crate::agent::models::ModelFetchAuth,
-) -> Result<FetchModelsResult, BackendError> {
-    let client = crate::http::shared_startup_blocking_client();
-    let source = ListModelsEndpoint::from_endpoints(endpoints, fetch_auth);
-    let inference_base_url = endpoints.resolve_inference_base_url();
-    tracing::info!("Fetching models from {}", source.url);
-    let mut request = client.get(&source.url);
-    match source.auth {
-        EndpointAuth::ApiKey => {
-            let api_key = crate::agent::auth_method::read_xai_api_key_env()
-                .or_else(|_| {
-                    auth.map(|a| a.key.clone())
-                        .ok_or(std::env::VarError::NotPresent)
-                })
-                .map_err(|_| {
-                    BackendError::Auth(
-                        "No API key for custom models endpoint. Set XAI_API_KEY.".into(),
-                    )
-                })?;
-            request = request.header("Authorization", format!("Bearer {}", api_key));
-        }
-        EndpointAuth::Session => {
-            let auth = auth.ok_or_else(|| {
-                BackendError::Auth("No auth credentials for cli-chat-proxy".into())
-            })?;
-            request = request
-                .header("Authorization", format!("Bearer {}", &auth.key))
-                .header("X-XAI-Token-Auth", "xai-grok-cli")
-                .header("x-userid", &auth.user_id)
-                .header("x-grok-client-version", xai_grok_version::VERSION)
-                .header(
-                    crate::http::CLIENT_MODE_HEADER,
-                    crate::http::process_client_mode(),
-                );
-            if let Some(email) = &auth.email {
-                request = request.header("x-email", email);
-            }
-        }
-    }
-    let response = request.send()?;
-    if !response.status().is_success() {
-        let status = response.status().as_u16();
-        let body = response.text().unwrap_or_default();
-        tracing::warn!("Failed to fetch models: {} - {}", status, body);
-        return Err(BackendError::RequestFailed { status, body });
-    }
-    let etag = response
-        .headers()
-        .get("etag")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
-    let models_response: ModelsResponse = response.json()?;
-    tracing::info!(
-        "Fetched {} models from {}",
-        models_response.data.len(),
-        source.url
-    );
-    let mut models = Vec::with_capacity(models_response.data.len());
-    for (idx, value) in models_response.data.into_iter().enumerate() {
-        match parse_remote_model_value(&value, &inference_base_url) {
-            Some(model) => models.push(model),
-            None => {
-                tracing::warn!(
-                    "Skipping model at index {}: missing required field ('model' or 'context_window') or invalid types",
-                    idx
-                )
-            }
-        }
-    }
-    Ok(FetchModelsResult { models, etag })
 }
 /// Parse a single model entry from the /models-v2 response.
 /// Used by both initial model fetch and session-resume metadata refresh.
@@ -841,6 +716,10 @@ pub(crate) fn parse_remote_model_value(
         .or_else(|| id.clone())
         .or_else(|| meta.and_then(|m| get_string(m, "model")))
         .or_else(|| meta.and_then(|m| get_string(m, "modelId")))?;
+    let model_family = get_string(obj, "modelFamily")
+        .or_else(|| get_string(obj, "model_family"))
+        .or_else(|| meta.and_then(|m| get_string(m, "modelFamily")))
+        .or_else(|| meta.and_then(|m| get_string(m, "model_family")));
     let base_url = get_string(obj, "baseUrl")
         .or_else(|| get_string(obj, "base_url"))
         .unwrap_or_else(|| default_base_url.to_owned());
@@ -870,6 +749,7 @@ pub(crate) fn parse_remote_model_value(
     Some(crate::agent::config::ModelEntryConfig {
         id,
         model,
+        model_family,
         base_url,
         name,
         description: get_string(obj, "description"),
@@ -901,6 +781,9 @@ pub(crate) fn parse_remote_model_value(
             .or_else(|| get_u64(obj, "inference_idle_timeout_secs")),
         max_retries: get_u64(obj, "maxRetries")
             .or_else(|| get_u64(obj, "max_retries"))
+            .and_then(|v| u32::try_from(v).ok()),
+        subagent_rate_limit_max_attempts: get_u64(obj, "subagentRateLimitMaxAttempts")
+            .or_else(|| get_u64(obj, "subagent_rate_limit_max_attempts"))
             .and_then(|v| u32::try_from(v).ok()),
         hidden: obj
             .get("hidden")

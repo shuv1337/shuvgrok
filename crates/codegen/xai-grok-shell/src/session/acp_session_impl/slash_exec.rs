@@ -178,12 +178,22 @@ impl SessionActor {
                     .await;
                 } else {
                     match crate::config::remove_hooks_path(&path) {
-                        Ok(()) => {
+                        Ok(true) => {
                             xai_grok_telemetry::session_ctx::log_event(
                                 xai_grok_telemetry::events::HookRemoved { success: true },
                             );
                             self.send_host_turn_slash_command_output(&format!(
                                 "Removed hook path: {path}\nRestart session to stop loading hooks from this path."
+                            ))
+                            .await;
+                        }
+                        Ok(false) => {
+                            xai_grok_telemetry::session_ctx::log_event(
+                                xai_grok_telemetry::events::HookRemoved { success: false },
+                            );
+                            self.send_host_turn_slash_command_output(&format!(
+                                "{path} is not a user-registered hook directory; \
+                                 config-defined hook sources cannot be removed from here."
                             ))
                             .await;
                         }
@@ -318,10 +328,7 @@ impl SessionActor {
                 } else {
                     format!("**Model:** {}", model)
                 };
-                let model_hash_line = if crate::session::acp_types::should_show_model_fingerprint(
-                    info.show_model_fingerprint,
-                    &model,
-                ) {
+                let model_hash_line = if info.show_model_fingerprint {
                     info.model_fingerprint
                         .as_deref()
                         .map(|fp| format!("\n\n**Model Hash:** {fp}"))
@@ -826,6 +833,7 @@ impl SessionActor {
                     objective: query.clone(),
                     args: serde_json::json!({ "query": query }),
                     agent_budget: None,
+                    effort: None,
                     resume_run_id: None,
                 };
                 let launched = self.workflow_manager.lock().await.launch(resolved, spec);
@@ -848,7 +856,7 @@ impl SessionActor {
                         self.send_host_turn_slash_command_output(&format!(
                             "Deep research '{display}' started in the background. It will \
                              cross-check candidate claims and return a concise cited report here. \
-                             Use /workflows to follow progress."
+                             Use /workflow runs to follow progress."
                         ))
                         .await;
                         tokio::spawn(async move {

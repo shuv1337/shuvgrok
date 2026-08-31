@@ -10,13 +10,23 @@ use crate::session::signals::TurnDeltaSnapshot;
 use agent_client_protocol as acp;
 use tokio::sync::oneshot;
 /// Structured context for a cancelled turn, replacing stringly-typed JSON.
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+/// This is the wire shape of `cancellationContext` on the turn-end rails and
+/// of the AfterTurn hook payload's `cancellation_context`; clients
+/// deserialize into this same type. Keys are snake_case on purpose: that is
+/// the shape already shipped to AfterTurn hook consumers, and the convention
+/// for fields hooks receive. Absent fields are skipped.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct CancellationContext {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hook_name: Option<String>,
     /// What triggered the cancel (e.g. `"send_now"`, `"esc"`, `"mouse"`);
     /// surfaced as `cancelTrigger` on the turn-end `_meta`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub trigger: Option<String>,
 }
 /// Failure surface of a `/btw` side question. Kept typed until the ACP
@@ -58,6 +68,56 @@ pub enum PromptCompletionKind {
     /// the real turn is still in flight) must be skipped. See
     /// `MvpAgent::prompt`'s short-circuit and `respond_removed_prompt`.
     RemovedFromQueue,
+}
+/// `_meta.cancellationCategory` of a hook-denied cancel; the pager matches it
+/// to render the blocked-by-a-hook marker.
+pub const HOOK_DENIED_CATEGORY: &str = "HookDenied";
+/// `_meta.cancellationCategory` of a max-turns end; headless matches it to
+/// drive the max-turns exit code.
+pub const MAX_TURNS_REACHED_CATEGORY: &str = "max_turns_reached";
+/// `_meta.cancellationCategory` of a stationarity end.
+pub const ACTION_STATIONARITY_CATEGORY: &str = "action_stationarity";
+/// `_meta.cancellationCategory` wire name of a cancel category — an explicit
+/// match so a variant rename cannot silently change the wire. Deliberately a
+/// second vocabulary next to the serde snake_case of the events.jsonl /
+/// after-turn rails: `_meta` shipped PascalCase and clients match it.
+pub fn meta_category_str(
+    category: xai_grok_session_events::types::CancellationCategory,
+) -> &'static str {
+    use xai_grok_session_events::types::CancellationCategory;
+    match category {
+        CancellationCategory::HookDenied => HOOK_DENIED_CATEGORY,
+        CancellationCategory::PermissionRejected => "PermissionRejected",
+        CancellationCategory::PermissionCancelled => "PermissionCancelled",
+        CancellationCategory::MidTurnAbort => "MidTurnAbort",
+    }
+}
+impl PromptCompletionKind {
+    /// The completion's `_meta.cancellationCategory`, shared by every terminal
+    /// rail (`PromptResponse` `_meta`, legacy `prompt_complete`, durable
+    /// `TurnCompleted`) so the wires never disagree.
+    pub fn cancellation_category_meta(&self) -> Option<String> {
+        match self {
+            Self::Cancelled { category, .. } => {
+                category.map(|cat| meta_category_str(cat).to_string())
+            }
+            Self::MaxTurnsReached { .. } => Some(MAX_TURNS_REACHED_CATEGORY.to_string()),
+            Self::StationarityEnded => Some(ACTION_STATIONARITY_CATEGORY.to_string()),
+            Self::Completed | Self::Rewound | Self::RemovedFromQueue => None,
+        }
+    }
+    /// The completion's `_meta.cancellationContext` (hook name, reason,
+    /// trigger), stamped beside `cancellationCategory` so a client can show
+    /// WHY a turn was blocked without scraping annotations. Additive: shipped
+    /// clients ignore unknown `_meta` keys.
+    pub fn cancellation_context_meta(&self) -> Option<serde_json::Value> {
+        match self {
+            Self::Cancelled {
+                context: Some(ctx), ..
+            } => serde_json::to_value(ctx).ok(),
+            _ => None,
+        }
+    }
 }
 /// Successful prompt/turn payload returned to the ACP layer and trace uploaders.
 #[derive(Debug, Clone)]
@@ -190,11 +250,20 @@ impl CancelTrigger {
         }
     }
 }
+/// What a cancel does to the in-memory conversation history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum CancelHistoryDisposition {
+    /// Leave the cancelled turn's user message in history.
+    #[default]
+    Keep,
+    /// Pop the named front if the no-output window is still open. `None` is a legacy client.
+    RewindIfNoOutput { prompt_id: Option<String> },
+}
 #[derive(Debug, Clone, Default)]
 pub struct CancelOptions {
     pub cancel_subagents: bool,
     pub kill_background_tasks: bool,
-    pub rewind_if_no_output: bool,
+    pub history: CancelHistoryDisposition,
     pub trigger: Option<CancelTrigger>,
     /// Drives the cancel-rate metric, and marks an untriggered cancel as the user's.
     pub user_initiated: bool,
@@ -210,11 +279,22 @@ pub enum SessionCommand {
     ReplaceSystemPrompt {
         system_prompt: String,
     },
+    /// Push a fresh status-line snapshot. Sent when a client attaches to a
+    /// resident session, which the transient `SessionStatus` notification would
+    /// otherwise never reach.
+    EmitStatusSnapshot,
     /// Resume hook: after a session is restored with
     /// `awaiting_plan_approval == true`, re-issue the `exit_plan_mode`
     /// reverse-request so the client re-shows approval chrome over a real live
     /// waiter. Fire-and-forget; the actor spawns the round-trip + decision.
     RestorePlanApproval,
+    /// A `/rename` landed for this resident session. `manual: true` (a user
+    /// title) freezes the auto title refresh and aborts any in-flight one;
+    /// `manual: false` (`/rename --auto`) reopens it so the whole-conversation
+    /// refresh can re-title.
+    TitleRenamed {
+        manual: bool,
+    },
     GetToolOverrides {
         respond_to: oneshot::Sender<Option<xai_grok_sampling_types::ToolOverrides>>,
     },
@@ -251,16 +331,32 @@ pub enum SessionCommand {
         admission: Option<TaskWakeAdmission>,
         tool_overrides_update: Option<xai_grok_sampling_types::ToolOverridesUpdate>,
         respond_to: oneshot::Sender<PromptTurnResult>,
-        /// Optional oneshot fired after the user message has been appended to
-        /// chat history and a persistence flush barrier has completed, before
-        /// LLM inference begins. Used by callers that need to ensure
-        /// `chat_history.jsonl` includes the prompt before trace snapshots or
-        /// `session/load`.
+        /// Optional initial-child readiness. Carried onto the queued item and
+        /// resolved only when that exact row is promoted, or closed on removal.
+        prompt_admitted: Option<oneshot::Sender<()>>,
+        /// Optional oneshot fired once the prompt's persistence is settled,
+        /// before LLM inference begins: after the user message has been
+        /// appended to chat history and a flush barrier has completed — or
+        /// immediately when a `UserPromptSubmit` hook blocked the prompt, in
+        /// which case nothing was stored and there is nothing to flush. Used
+        /// by callers that need `chat_history.jsonl` settled before trace
+        /// snapshots or `session/load`; a blocked prompt never appears there.
         persist_ack: Option<oneshot::Sender<()>>,
         /// Pre-parsed prompt content blocks from `parse_prompt`, sent back to the
         /// caller so it can use the fully-rendered prompt for metadata.json without
         /// re-parsing. The session sends on this channel right after parsing.
         parsed_prompt_tx: Option<oneshot::Sender<ParsedPromptInfo>>,
+    },
+    /// Admit an owning root's model-authored message as an ordinary protected turn.
+    ParentAgentMessage {
+        delivery:
+            xai_grok_tools::implementations::grok_build::task::types::ActiveAgentMessageDelivery,
+        #[allow(private_interfaces)]
+        receipt_sink: tokio::sync::mpsc::Sender<crate::agent::subagent::PromptTurnReceipt>,
+        parent_telemetry_ctx: xai_grok_telemetry::TelemetryCtx,
+        respond_to: oneshot::Sender<
+            xai_grok_tools::implementations::grok_build::task::coordinator::ActiveMessageAdmission,
+        >,
     },
     SessionMode {
         session_mode: acp::SessionModeId,
@@ -269,6 +365,8 @@ pub enum SessionCommand {
     SetSessionModel {
         sampling_config: xai_grok_sampler::SamplerConfig,
         use_concise: bool,
+        /// Models declare differing `model_family`s → compact (lossy) at switch end.
+        is_family_switch: bool,
         /// When `false`, skip the system prompt rewrite (concise/default swap).
         /// Set to `false` for forked sessions so mid-session model switches
         /// cannot contaminate the inherited prompt configuration.
@@ -411,6 +509,15 @@ pub enum SessionCommand {
     /// its response on the merge.
     ReconcileRewindTracker {
         target_prompt_index: usize,
+    },
+    /// Acquire the image-strip rewrite boundary before a bridge rewind.
+    AcquireImageStripRewrite {
+        respond_to: oneshot::Sender<tokio::sync::OwnedRwLockWriteGuard<()>>,
+    },
+    /// Invalidate pending image-strip work after a server-side conversation
+    /// rewind commits. Acknowledged for ordering.
+    InvalidateImageStripsForRewind {
+        respond_to: oneshot::Sender<()>,
     },
     /// xAI extension session notification - client-side events to store in persistence
     XaiSessionNotification {
@@ -768,7 +875,7 @@ pub enum SessionCommand {
     ///
     /// Fired by the client after a turn completes. The session builds a
     /// compact text-only transcript of the recent conversation, makes one
-    /// tool-free model call (default `grok-build-0.1` when available via
+    /// tool-free model call (default `grok-4.6` when available via
     /// `model_override`, else the session model), sanitizes the output, and
     /// returns the predicted prompt via `respond_to`. Best-effort: any
     /// failure returns `None`.
@@ -778,7 +885,7 @@ pub enum SessionCommand {
     },
     /// Rewrite a raw memory note into well-structured markdown via a one-shot
     /// LLM call. The session uses `prepare_chat_completion()` with
-    /// `grok-build` model, low temperature, and capped output tokens.
+    /// `grok-4.6` model, low temperature, and capped output tokens.
     RewriteMemoryNote {
         raw_text: String,
         context_summary: String,
@@ -851,6 +958,56 @@ pub enum SessionCommand {
         commit: Option<String>,
         branch: Option<String>,
     },
+}
+#[cfg(test)]
+mod cancellation_category_meta_tests {
+    use super::PromptCompletionKind;
+    use xai_grok_session_events::types::CancellationCategory;
+    /// Pins every `_meta.cancellationCategory` wire name: shipped clients
+    /// string-match these, so a rename is a wire break the compiler can't see.
+    #[test]
+    fn pins_every_wire_name() {
+        let cancelled = |category| PromptCompletionKind::Cancelled {
+            category,
+            context: None,
+        };
+        for (kind, expected) in [
+            (
+                cancelled(Some(CancellationCategory::HookDenied)),
+                Some("HookDenied"),
+            ),
+            (
+                cancelled(Some(CancellationCategory::MidTurnAbort)),
+                Some("MidTurnAbort"),
+            ),
+            (
+                cancelled(Some(CancellationCategory::PermissionRejected)),
+                Some("PermissionRejected"),
+            ),
+            (
+                cancelled(Some(CancellationCategory::PermissionCancelled)),
+                Some("PermissionCancelled"),
+            ),
+            (cancelled(None), None),
+            (
+                PromptCompletionKind::MaxTurnsReached { limit: 1 },
+                Some("max_turns_reached"),
+            ),
+            (
+                PromptCompletionKind::StationarityEnded,
+                Some("action_stationarity"),
+            ),
+            (PromptCompletionKind::Completed, None),
+            (PromptCompletionKind::Rewound, None),
+            (PromptCompletionKind::RemovedFromQueue, None),
+        ] {
+            assert_eq!(
+                kind.cancellation_category_meta().as_deref(),
+                expected,
+                "{kind:?}"
+            );
+        }
+    }
 }
 #[cfg(test)]
 mod cancel_trigger_tests {

@@ -6,7 +6,9 @@
 //! which is the in-TUI equivalent of `grok login --provider <id>`.
 
 use crate::app::actions::Action;
-use crate::slash::command::{AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand};
+use crate::slash::command::{
+    AppCtx, ArgItem, CommandExecCtx, CommandResult, SlashCommand, slash_meta,
+};
 
 /// Provider ids accepted as `/login` arguments, with the labels shown in the
 /// dropdown. Mirrors `SubscriptionProvider` in the shell; kept as plain data
@@ -101,20 +103,11 @@ impl SlashCommand for ProviderLoginCommand {
 pub struct LoginCommand;
 
 impl SlashCommand for LoginCommand {
-    fn name(&self) -> &str {
-        "login"
-    }
-
-    fn description(&self) -> &str {
-        "Log in or re-authenticate (optionally with Claude or ChatGPT)"
-    }
-
-    fn usage(&self) -> &str {
-        "/login [xai|anthropic|openai-codex]"
-    }
-
-    fn takes_args(&self) -> bool {
-        true
+    slash_meta! {
+        name: "login",
+        description: "Log in or re-authenticate (optionally with Claude or ChatGPT)",
+        usage: "/login [xai|anthropic|openai-codex]",
+        takes_args: true,
     }
 
     /// Required, so Enter on a bare `/login` opens the provider dropdown

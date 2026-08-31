@@ -2,6 +2,15 @@
 //! its buffered/transient/direct variants, xAI-notification handling, and
 //! the gateway-bridge dispatch shims.
 use super::*;
+/// Hook / image-intake diagnostics leave the no-output rewind window open; every other variant closes it.
+pub(super) fn closes_cancel_rewind_window(update: &XaiSessionUpdate) -> bool {
+    !matches!(
+        update,
+        XaiSessionUpdate::HookExecution { .. }
+            | XaiSessionUpdate::ImageCompressed { .. }
+            | XaiSessionUpdate::ImageDropped { .. }
+    )
+}
 fn scrub_inbound_session_summary(
     notification: &mut crate::extensions::notification::SessionNotification,
 ) {
@@ -514,6 +523,11 @@ impl SessionActor {
     ///
     /// Must NOT be called from within `run_session()` — the flush goes through
     /// `event_tx`, which is consumed by the same select loop (deadlock / 5s timeout).
+    #[tracing::instrument(
+        name = "session.flush_to_disk",
+        skip_all,
+        fields(session_id = %self.session_info.id.0)
+    )]
     pub(super) async fn flush_to_disk(&self) -> std::io::Result<()> {
         if let Err(e) = crate::session::replay_events::flush_replay_actor(&self.event_tx).await {
             tracing::warn!(?e, "flush_replay_actor failed");
@@ -899,8 +913,12 @@ impl SessionActor {
     /// Send an xAI extension notification to the client
     #[tracing::instrument(skip_all)]
     pub(super) async fn send_xai_notification(&self, update: XaiSessionUpdate) {
-        self.send_xai_notification_with_extra_meta(update, None)
-            .await;
+        self.send_xai_notification_with_extra_meta(
+            update,
+            None,
+            crate::session::storage::jsonl::AppendDurability::Buffered,
+        )
+        .await;
     }
     /// Build the per-response boundary update, projecting the response's usage
     /// into the Messages API `message.usage` shape (uncached `input_tokens`).
@@ -936,13 +954,23 @@ impl SessionActor {
     }
     /// [`Self::send_xai_notification`] with caller-supplied `_meta` keys merged
     /// into the standard eventId/timestamp meta. Caller keys win on collision.
+    ///
+    /// `durability` picks the persistence rail: `Buffered` rides the merge
+    /// buffer (page cache until the next barrier); `Durable` drains pending
+    /// updates first and fsyncs the record when written. The durable append is
+    /// fire-and-forget on purpose — nothing gates on it (the turn's RPC has
+    /// already resolved by the terminal-emit sites) and the persistence actor
+    /// logs failures whose ack has no reader.
     #[tracing::instrument(skip_all)]
     pub(super) async fn send_xai_notification_with_extra_meta(
         &self,
         update: XaiSessionUpdate,
         extra_meta: Option<serde_json::Map<String, serde_json::Value>>,
+        durability: crate::session::storage::jsonl::AppendDurability,
     ) {
-        self.close_rewind_window().await;
+        if closes_cancel_rewind_window(&update) {
+            self.close_rewind_window().await;
+        }
         let meta = {
             let mut meta = self.build_notification_meta();
             if let (Some(obj), Some(extra)) = (meta.as_object_mut(), extra_meta) {
@@ -955,12 +983,25 @@ impl SessionActor {
             update,
             meta: Some(meta),
         };
-        let _ = self
-            .notifications
-            .persistence_tx
-            .send(PersistenceMsg::Update(
-                crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone())),
-            ));
+        let persisted_update =
+            crate::session::storage::SessionUpdate::Xai(Box::new(notification.clone()));
+        match durability {
+            crate::session::storage::jsonl::AppendDurability::Buffered => {
+                let _ = self
+                    .notifications
+                    .persistence_tx
+                    .send(PersistenceMsg::Update(persisted_update));
+            }
+            crate::session::storage::jsonl::AppendDurability::Durable => {
+                let (respond_to, _) = tokio::sync::oneshot::channel();
+                let _ = self.notifications.persistence_tx.send(
+                    PersistenceMsg::AppendUpdateDurablyAndAck {
+                        update: persisted_update,
+                        respond_to,
+                    },
+                );
+            }
+        }
         let params = serde_json::to_value(&notification)
             .and_then(|v| serde_json::value::to_raw_value(&v))
             .ok();

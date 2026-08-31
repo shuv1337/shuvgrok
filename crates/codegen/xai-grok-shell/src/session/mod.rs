@@ -2,13 +2,16 @@ pub mod acp_types;
 pub mod announcement_state;
 pub mod commands;
 pub(crate) mod compaction_config;
+pub(crate) mod doom_loop_telemetry;
 pub mod handle;
 pub(crate) mod memory_state;
 pub mod merge;
+pub(crate) mod message_delivery;
 pub mod notifications;
 pub mod pending_interaction;
 pub mod prompt_queue;
 pub mod two_pass;
+pub mod visibility;
 pub use self::acp_session::*;
 pub use self::acp_types::*;
 pub use self::commands::*;
@@ -21,7 +24,9 @@ pub use self::persistence::{
 pub use self::result::{Empty, ExtMethodResult};
 pub use self::share::{ShareSessionRequest, ShareSessionResponse};
 pub use prod_mc_cli_chat_proxy_types::feedback_types::{
-    ClientType, FeedbackTerminalInfo, RatingType,
+    ClientType, FeedbackImage, FeedbackTerminalInfo, MAX_FEEDBACK_IMAGE_BYTES,
+    MAX_FEEDBACK_IMAGE_TOTAL_BYTES, MAX_FEEDBACK_IMAGES, RatingType, feedback_image_extension,
+    validate_feedback_images,
 };
 pub use xai_fsnotify::{FsConfig, FsEvent, FsEventKind, FsEventSource, FsNotifyError, GitMetaKind};
 /// `false` twin: this template is not compiled into this build, so no
@@ -31,6 +36,28 @@ pub(crate) fn is_cursor_user_template(
     _template: &xai_grok_agent::prompt::user_message::UserMessageTemplate,
 ) -> bool {
     false
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CompactionPins {
+    pub mode: xai_chat_state::CompactionMode,
+    pub two_pass: bool,
+}
+pub(crate) fn cursor_compaction_pins(
+    resolved_mode: xai_chat_state::CompactionMode,
+    resolved_two_pass: bool,
+    is_cursor: bool,
+) -> CompactionPins {
+    if is_cursor {
+        CompactionPins {
+            mode: xai_chat_state::CompactionMode::Summary,
+            two_pass: false,
+        }
+    } else {
+        CompactionPins {
+            mode: resolved_mode,
+            two_pass: resolved_two_pass,
+        }
+    }
 }
 /// `false` twin of [`is_cursor_system_template`]; see [`is_cursor_user_template`].
 pub(crate) fn is_cursor_system_template(
@@ -52,8 +79,11 @@ pub(crate) fn image_blocks(
         })
         .collect()
 }
-/// Describes who originated a prompt: the user, or the shell's auto-wake
-/// system reacting to a completed background task / subagent.
+pub use xai_agent_lifecycle::{
+    AnalyticsClass, CompactionClass, InputAuthority, InputPolicy, QueuePolicy, ShutdownPolicy,
+    TurnBoundary,
+};
+/// Describes who originated a prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptOrigin {
     /// A normal user-initiated prompt.
@@ -67,6 +97,11 @@ pub enum PromptOrigin {
     SubagentCompleted {
         /// The subagent ID (without the `subagent-completed-` prefix).
         subagent_id: String,
+    },
+    /// Model-authored context sent by the owning root session.
+    ParentAgentMessage {
+        message_id: String,
+        sender_session_id: String,
     },
     WorkflowCompleted {
         completion_id: String,
@@ -104,6 +139,11 @@ impl PromptOrigin {
             Self::SubagentCompleted {
                 subagent_id: subagent_id.to_string(),
             }
+        } else if let Some(parent_message_id) = prompt_id.strip_prefix("parent-message-") {
+            Self::ParentAgentMessage {
+                message_id: parent_message_id.to_string(),
+                sender_session_id: String::new(),
+            }
         } else if let Some(completion_id) = prompt_id.strip_prefix("workflow-completed-") {
             Self::WorkflowCompleted {
                 completion_id: completion_id.to_string(),
@@ -122,6 +162,48 @@ impl PromptOrigin {
             Self::User
         }
     }
+    pub fn policy(&self) -> InputPolicy {
+        match self {
+            Self::User => InputPolicy {
+                authority: InputAuthority::HumanIntent,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::HumanPrompt,
+                compaction: CompactionClass::HumanAnchor,
+                queue: QueuePolicy::VisibleEditable,
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::ParentAgentMessage { .. } => InputPolicy {
+                authority: InputAuthority::ModelAuthoredUntrusted,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::AgentMessage,
+                compaction: CompactionClass::ConversationalAgentAnchor,
+                queue: QueuePolicy::VisibleProtected,
+                shutdown: ShutdownPolicy::Drain,
+            },
+            Self::TaskCompleted { .. }
+            | Self::SubagentCompleted { .. }
+            | Self::WorkflowCompleted { .. }
+            | Self::SchedulerFired => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::CancelWithProducer,
+            },
+            Self::NotificationDrain
+            | Self::GoalSummary
+            | Self::GoalClassifierNudge
+            | Self::PlanResume => InputPolicy {
+                authority: InputAuthority::RuntimeControl,
+                turn_boundary: TurnBoundary::Conversational,
+                analytics: AnalyticsClass::RuntimeWake,
+                compaction: CompactionClass::RuntimeEphemera,
+                queue: QueuePolicy::Hidden,
+                shutdown: ShutdownPolicy::DropEphemeral,
+            },
+        }
+    }
     /// Returns `true` for auto-wake (synthetic) prompts.
     pub fn is_synthetic(&self) -> bool {
         !matches!(self, Self::User)
@@ -134,7 +216,10 @@ impl PromptOrigin {
     /// real user turns always render.
     pub fn hide_user_echo_from_scrollback(&self) -> bool {
         match self {
-            Self::User | Self::SchedulerFired | Self::PlanResume => false,
+            Self::User
+            | Self::ParentAgentMessage { .. }
+            | Self::SchedulerFired
+            | Self::PlanResume => false,
             Self::TaskCompleted { .. }
             | Self::SubagentCompleted { .. }
             | Self::WorkflowCompleted { .. }
@@ -149,6 +234,7 @@ impl PromptOrigin {
             Self::SubagentCompleted { subagent_id } => Some(subagent_id),
             Self::WorkflowCompleted { completion_id } => Some(completion_id),
             Self::User
+            | Self::ParentAgentMessage { .. }
             | Self::NotificationDrain
             | Self::GoalSummary
             | Self::GoalClassifierNudge
@@ -159,7 +245,7 @@ impl PromptOrigin {
 }
 #[cfg(test)]
 mod tests {
-    use super::PromptOrigin;
+    use super::{PromptOrigin, QueuePolicy};
     #[test]
     fn from_prompt_id_user() {
         assert_eq!(
@@ -179,6 +265,18 @@ mod tests {
         );
         assert!(origin.is_synthetic());
         assert_eq!(origin.completion_id(), Some("abc-123"));
+    }
+    #[test]
+    fn from_prompt_id_parent_message() {
+        let origin = PromptOrigin::from_prompt_id("parent-message-msg-123");
+        assert_eq!(
+            origin,
+            PromptOrigin::ParentAgentMessage {
+                message_id: "msg-123".into(),
+                sender_session_id: String::new(),
+            }
+        );
+        assert!(origin.is_synthetic());
     }
     #[test]
     fn from_prompt_id_subagent_completed() {
@@ -241,8 +339,54 @@ mod tests {
         assert!(PromptOrigin::from_prompt_id(prompt_id).is_synthetic());
     }
     #[test]
+    fn current_origin_queue_policies_are_preserved() {
+        let cases = [
+            (PromptOrigin::User, QueuePolicy::VisibleEditable),
+            (
+                PromptOrigin::TaskCompleted {
+                    task_id: "t".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (
+                PromptOrigin::SubagentCompleted {
+                    subagent_id: "s".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (
+                PromptOrigin::ParentAgentMessage {
+                    message_id: "m".into(),
+                    sender_session_id: "root".into(),
+                },
+                QueuePolicy::VisibleProtected,
+            ),
+            (
+                PromptOrigin::WorkflowCompleted {
+                    completion_id: "w".into(),
+                },
+                QueuePolicy::Hidden,
+            ),
+            (PromptOrigin::NotificationDrain, QueuePolicy::Hidden),
+            (PromptOrigin::GoalSummary, QueuePolicy::Hidden),
+            (PromptOrigin::GoalClassifierNudge, QueuePolicy::Hidden),
+            (PromptOrigin::SchedulerFired, QueuePolicy::Hidden),
+            (PromptOrigin::PlanResume, QueuePolicy::Hidden),
+        ];
+        for (origin, queue) in cases {
+            assert_eq!(origin.policy().queue, queue, "{origin:?}");
+        }
+    }
+    #[test]
     fn hide_user_echo_from_scrollback_by_origin() {
         assert!(!PromptOrigin::User.hide_user_echo_from_scrollback());
+        assert!(
+            !PromptOrigin::ParentAgentMessage {
+                message_id: "m".into(),
+                sender_session_id: "root".into(),
+            }
+            .hide_user_echo_from_scrollback()
+        );
         assert!(
             !PromptOrigin::from_prompt_id("scheduler-fired-abc").hide_user_echo_from_scrollback()
         );
@@ -334,9 +478,11 @@ pub(crate) mod mcp_descriptors;
 pub(crate) mod mcp_dispatcher;
 #[cfg(test)]
 mod mcp_dispatcher_e2e_tests;
+pub(crate) mod mcp_elicitation;
 pub(crate) mod mcp_restart;
 pub mod mcp_servers;
 pub mod memory;
+pub(crate) mod memory_observation;
 pub(crate) mod normalize_cache;
 pub mod persistence;
 pub use xai_grok_shared::placeholder_images;
@@ -350,6 +496,7 @@ pub mod repo_changes;
 pub mod restore;
 pub mod result;
 pub mod signals;
+pub(crate) mod slash_authority;
 pub(crate) mod slash_commands;
 pub use slash_commands::PAGER_COMMAND_KEYS;
 pub mod storage;

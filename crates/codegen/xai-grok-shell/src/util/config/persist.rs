@@ -9,11 +9,19 @@ use xai_grok_agent::prompt::skills::SkillsConfig;
 /// Serializes the read-modify-write in `save_config` so two rapid
 /// settings toggles can't interleave and clobber each other.
 static SAVE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// Blank (first-run 0-byte file) is an empty table; other unparseable TOML is
+/// an error so a silent fallback cannot drop unmodeled sections.
+pub(crate) fn parse_existing_config_toml(s: &str) -> Result<TomlValue, toml::de::Error> {
+    if s.trim().is_empty() {
+        return Ok(TomlValue::Table(TomlMap::new()));
+    }
+    toml::from_str(s)
+}
 /// [`save_config`] body; caller must hold [`SAVE_LOCK`].
 async fn save_config_locked(config: &Config) -> Result<()> {
     let path = user_config_path();
     let mut root: TomlValue = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => match toml::from_str::<TomlValue>(&s) {
+        Ok(s) => match parse_existing_config_toml(&s) {
             Ok(v) => v,
             Err(parse_err) => {
                 return Err(anyhow::anyhow!(
@@ -41,11 +49,21 @@ async fn save_config_locked(config: &Config) -> Result<()> {
     } else {
         merge_section(table, "privacy", &config.privacy);
     }
+    if config.consent == super::consent::ConsentConfig::default() {
+        table.remove("consent");
+    } else {
+        if let Some(TomlValue::Table(section)) = table.get_mut("consent") {
+            section.remove("answers");
+        }
+        merge_section(table, "consent", &config.consent);
+    }
     if config.skills == SkillsConfig::default() {
         table.remove("skills");
     } else {
         merge_section(table, "skills", &config.skills);
     }
+    merge_section(table, "telemetry", &config.telemetry);
+    merge_section(table, "features", &config.features);
     let toml_str = toml::to_string_pretty(&root)?;
     if let Some(parent) = path.parent() {
         let _ = tokio::fs::create_dir_all(parent).await;

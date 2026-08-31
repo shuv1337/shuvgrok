@@ -36,7 +36,10 @@ pub(crate) fn model_provider_auth_name(provider_id: &str) -> String {
 /// [`super::config::validate_subagent_fanout`], after all sections are parsed.
 pub(crate) fn parse_subagent_fanout(
     raw_config: &toml::Value,
-) -> (Option<crate::agent::config::SubagentFanoutConfig>, Vec<ConfigWarning>) {
+) -> (
+    Option<crate::agent::config::SubagentFanoutConfig>,
+    Vec<ConfigWarning>,
+) {
     let mut warnings = Vec::new();
     let Some(section) = raw_config.get("subagent_fanout") else {
         return (None, warnings);

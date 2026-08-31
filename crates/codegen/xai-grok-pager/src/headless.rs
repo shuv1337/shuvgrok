@@ -1,7 +1,7 @@
 //! Headless single-turn mode (`grok -p "prompt"`).
 //!
-//! Runs the agent in-process via `spawn_grok_shell`, drives the ACP lifecycle
-//! (init, auth, session, prompt), streams to stdout, and exits via `CancellationToken`.
+//! Runs the agent in-process via `spawn_grok_shell` and drives the ACP lifecycle (init, auth, session, prompt).
+//! Streams to stdout and exits via `CancellationToken`.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -75,7 +75,7 @@ pub struct HeadlessOptions {
     pub reasoning_effort: Option<String>,
     /// Wait for background tasks to report `task_completed` before exiting (default true).
     pub wait_for_background: bool,
-    /// Max time to wait for background quiescence after the first turn ends.
+    /// Max time to wait for background work to finish after the first turn ends.
     pub background_wait_timeout: Duration,
 }
 
@@ -89,7 +89,7 @@ struct HeadlessEmitter {
     usage: Option<serde_json::Value>,
     /// Reducer for the streaming formats; `None` for `plain`/`json`.
     reducer: Option<Box<dyn Reducer>>,
-    /// Set when the prompt is sent; the terminal `result.duration_ms` wall-clock.
+    /// Set when the prompt is sent; `result.duration_ms` on the terminal line is measured from it.
     prompt_started: Option<Instant>,
     out: std::io::Stdout,
     /// Latched once stdout is unwritable so later writes are dropped instead of panicking.
@@ -560,7 +560,14 @@ async fn open_session(
     }
 
     let new_resp: acp::NewSessionResponse = acp_send(
-        acp::NewSessionRequest::new(cwd.to_path_buf()).mcp_servers(mcp_servers),
+        acp::NewSessionRequest::new(cwd.to_path_buf())
+            .mcp_servers(mcp_servers)
+            // Fresh `-p` sessions persist as headless so `/resume` keeps them off its default pages; the load path above never restamps
+            .meta(
+                serde_json::json!({ "sessionKind": "headless" })
+                    .as_object()
+                    .cloned(),
+            ),
         acp_tx,
     )
     .await?;
@@ -584,7 +591,7 @@ async fn open_session_with_id(
         acp::NewSessionRequest::new(cwd.to_path_buf())
             .mcp_servers(mcp_servers)
             .meta(
-                serde_json::json!({ "sessionId": session_id })
+                serde_json::json!({ "sessionId": session_id, "sessionKind": "headless" })
                     .as_object()
                     .cloned(),
             ),
@@ -618,7 +625,10 @@ async fn fork_then_open(
         ensure_session_id_available(nid, &new_cwd_str)?;
     }
     let parent_is_worktree = parent_session_is_worktree(parent_id, &write_cwd);
-    let payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree);
+    let mut payload = fork_session_params(parent_id, &write_cwd, new_id, parent_is_worktree);
+    // Shared helper stamps `fork` for interactive `/fork`
+    // `-p` children must stay headless: the load path below never restamps
+    payload["sessionKind"] = serde_json::Value::String("headless".into());
     let fork_params = serde_json::value::to_raw_value(&payload)
         .map_err(|e| anyhow::anyhow!("serialize fork params: {e}"))?;
     let req = acp::ExtRequest::new("x.ai/session/fork", fork_params.into());
@@ -636,8 +646,8 @@ async fn fork_then_open(
     }
 }
 
-/// Apply `-m` / effort after session open. Effort is soft-ignored on a non-supporting
-/// model (still applying `-m`) but hard-fails on a genuinely unknown token.
+/// Apply `-m` / effort after session open.
+/// Effort is soft-ignored on a non-supporting model (still applying `-m`) but hard-fails on a genuinely unknown token.
 async fn apply_headless_model_and_effort(
     acp_tx: &AcpAgentTx,
     session_id: &acp::SessionId,
@@ -723,8 +733,7 @@ async fn apply_headless_model_and_effort(
 }
 
 /// Startup-materialization context for headless (`-p`) runs; never chat mode.
-/// `--worktree` is ignored here: headless never creates a worktree, so remote
-/// miss must not take `DeferToWorktree`.
+/// `--worktree` is ignored here: headless never creates a worktree, so a remote miss must not take `DeferToWorktree`.
 fn headless_materialize_ctx(
     resume_title_pinned: bool,
     restore_code: bool,
@@ -740,6 +749,7 @@ fn headless_materialize_ctx(
             crate::app::session_startup::TitleResolution::Allowed
         },
         restore_code,
+        recent_session_selection: crate::app::session_startup::RecentSessionSelection::Any,
         restore_progress_on_stdout: false,
     }
 }
@@ -774,7 +784,7 @@ pub async fn run_single_turn(
     let mut agent_config = AgentConfig::new_from_toml_cfg(&raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
 
-    // Canonical-only early stamp; remaps need the post-session catalog resolve below.
+    // Only canonical tokens are stamped early; remapped menu ids need the post-session catalog resolve below
     if let Some(ref token) = options.reasoning_effort
         && let Some(effort) = parse_canonical_effort_token(token)
     {
@@ -792,8 +802,7 @@ pub async fn run_single_turn(
         cli_subagents: None,
         cli_web_search_model: None,
         cli_session_summary_model: None,
-        cli_experimental_memory: false,
-        cli_no_memory: false,
+        memory_enabled_override: None,
         disable_web_search: options.disable_web_search,
         todo_gate: false,
         laziness_debug_log: None,
@@ -806,6 +815,7 @@ pub async fn run_single_turn(
         options.yolo,
         options.permission_mode_flag.as_deref(),
         None,
+        xai_grok_shell::util::config::PermissionMode::Ask,
     );
 
     apply_agent_flag(&options.agent, &mut agent_config);
@@ -830,7 +840,7 @@ pub async fn run_single_turn(
     };
 
     if options.trust {
-        xai_grok_shell::agent::folder_trust::grant_folder_trust(&cwd);
+        xai_grok_workspace::folder_trust::grant_folder_trust(&cwd);
     }
 
     let cancel = CancellationToken::new();
@@ -1113,7 +1123,7 @@ pub async fn run_single_turn(
     let mut prompt_result = None;
     // Tracked regardless of wait_for_background so the exit reaper always sees running work.
     let mut pending_bg: HashSet<BackgroundWork> = HashSet::new();
-    // Tombstone of completed ids so an out-of-order backgrounded never re-arms them.
+    // Tombstone of completed ids so an out-of-order task_backgrounded or subagent_spawned never re-adds them to pending
     let mut completed_bg: HashSet<BackgroundWork> = HashSet::new();
     let mut prompt_done_at: Option<Instant> = None;
     // On mid-turn channel close, break (not bail) so the exit path still drains and reaps.
@@ -1285,9 +1295,9 @@ pub async fn run_single_turn(
             let is_max_turns = resp
                 .meta
                 .as_ref()
-                .and_then(|m| m.get("cancellationCategory"))
+                .and_then(|m| m.get(crate::app::CANCELLATION_CATEGORY_KEY))
                 .and_then(|v| v.as_str())
-                == Some("max_turns_reached");
+                == Some(xai_grok_shell::session::commands::MAX_TURNS_REACHED_CATEGORY);
             if is_max_turns {
                 emitter.on_max_turns();
                 emitter.on_end(&stop_reason, sid, rid);
@@ -1393,8 +1403,7 @@ async fn reap_pending_background_tasks(
     }
 }
 
-/// Track a background lifecycle event. `completed_bg` tombstones finished ids so a late or
-/// out-of-order backgrounded/spawned cannot resurrect them into `pending_bg`.
+/// `completed_bg` tombstones finished ids so a late or out-of-order task_backgrounded/subagent_spawned cannot resurrect them into `pending_bg`.
 fn track_background_lifecycle(
     event: ExtEvent,
     pending_bg: &mut HashSet<BackgroundWork>,
@@ -1461,8 +1470,8 @@ fn track_background_lifecycle(
     }
 }
 
-/// Non-blocking drain-to-empty of `acp_rx`, so background work buffered around prompt
-/// completion is recorded in `pending_bg` before the empty-check decides whether to exit.
+/// Non-blocking drain-to-empty of `acp_rx`.
+/// Background work buffered around prompt completion is recorded in `pending_bg` before the empty-check decides whether to exit.
 #[allow(clippy::too_many_arguments)]
 fn drain_pending_acp_messages(
     acp_rx: &mut AcpClientRx,

@@ -165,7 +165,7 @@ impl CompiledPolicy {
                 }
                 Some(ShellFileMode::Read) => &[ShellFileMode::Read],
                 Some(ShellFileMode::Write) => &[ShellFileMode::Write],
-                None => continue,
+                Some(ShellFileMode::Create) | None => continue,
             };
             for &token in &candidates {
                 if shell_arg_is_ambiguous(token) {
@@ -298,25 +298,74 @@ pub(crate) fn command_words_write_paths(words: &[String]) -> Vec<String> {
 /// `git --output`, `cp`/`mv` dest, `tee`/`truncate`, in-place `sed`/`rustfmt`,
 /// `uniq` output, ...). No safe-sink filtering — the caller decides.
 pub(crate) fn command_write_paths_in_tree(root: Node<'_>, src: &str) -> Vec<String> {
-    let mut out = Vec::new();
+    let split = command_write_paths_split(root, src);
+    let mut out = split.redirect_paths;
+    out.extend(split.word_paths);
+    out
+}
 
+/// [`command_write_paths_in_tree`] split by provenance: redirect targets
+/// (`> f`, `>> f` — invisible to allow-rule word matching) vs command-word
+/// operands (`touch f`, `sed -i` — part of the words a rule matches). The
+/// distinction decides whether a narrow allow rule can vouch for the write.
+pub(crate) struct WritePathsSplit {
+    pub(crate) redirect_paths: Vec<String>,
+    /// A write redirect had no extractable target (`> $OUT`, `> "$(…)"`).
+    /// Fail-closed signal: the write exists but nothing can vouch for it.
+    pub(crate) unextracted_write_redirect: bool,
+    pub(crate) word_paths: Vec<String>,
+    /// `mkdir`/`touch` operands (kept out of `word_paths`) for the protected-target floor.
+    pub(crate) creation_paths: Vec<String>,
+}
+
+pub(crate) fn command_write_paths_split(root: Node<'_>, src: &str) -> WritePathsSplit {
     // Output redirects (`> f`, `>> f`); fd-dups/heredocs are already skipped.
-    for redirect in shell_redirect_targets(root, src) {
-        if matches!(redirect.mode, ShellFileMode::Write)
-            && let Some(path) = redirect.path
-        {
-            out.push(path);
+    let mut redirect_paths = Vec::new();
+    let mut unextracted_write_redirect = false;
+    for r in shell_redirect_targets(root, src) {
+        if matches!(r.mode, ShellFileMode::Write) {
+            match r.path {
+                Some(path) => redirect_paths.push(path),
+                None => unextracted_write_redirect = true,
+            }
         }
     }
     // Per-command writers, after peeling env/timeout/... wrappers.
+    let mut word_paths = Vec::new();
+    let mut creation_paths = Vec::new();
     for invocation in shell_command_invocations(root, src) {
         let words = InvocationSlice {
             words: &invocation.words,
         }
         .literal_words();
-        out.extend(command_words_write_paths(&words));
+        word_paths.extend(command_words_write_paths(&words));
+        creation_paths.extend(command_words_creation_paths(&words));
     }
-    out
+    WritePathsSplit {
+        redirect_paths,
+        unextracted_write_redirect,
+        word_paths,
+        creation_paths,
+    }
+}
+
+/// The creation set, shared by the write-path classifier and the auto-allow so they can't drift.
+pub(crate) fn is_creation_program(program: &str) -> bool {
+    matches!(program, "mkdir" | "touch")
+}
+
+/// The `Create`-mode operands that [`command_words_write_paths`] omits.
+pub(crate) fn command_words_creation_paths(words: &[String]) -> Vec<String> {
+    let inner = unwrap_wrappers(words);
+    let Some(program) = inner.first().map(|w| shell_program_name(w)) else {
+        return Vec::new();
+    };
+    shell_path_command_operands(&program.to_ascii_lowercase(), inner)
+        .into_iter()
+        .flatten()
+        .filter(|(_, mode)| matches!(mode, ShellFileMode::Create))
+        .map(|(path, _)| path.to_owned())
+        .collect()
 }
 
 /// Safe write sinks that do not touch a real file. Exact match.
@@ -515,7 +564,7 @@ fn protected_grok_config_file_with_home(
             | xai_grok_config::MANAGED_CONFIG_FILENAME
             | xai_grok_config::REQUIREMENTS_FILENAME,
         ) => ProtectedEditReason::GrokConfig,
-        Some("sandbox.toml") => ProtectedEditReason::GrokSandbox,
+        Some(xai_grok_config::SANDBOX_CONFIG_FILENAME) => ProtectedEditReason::GrokSandbox,
         _ => return None,
     };
     let in_dot_grok = components.len() >= 2 && components[components.len() - 2] == ".grok";
@@ -573,6 +622,8 @@ fn resolved_path_is_within_root(resolved_path: &Path, root: &Path) -> bool {
 pub(crate) enum ShellFileMode {
     Read,
     Write,
+    /// Empty dir/file creation (`mkdir`/`touch`): `Edit` for the inline-shell gate, not a content write.
+    Create,
 }
 
 /// Tools that read/write a file named as an argument. Not exhaustive — redirects
@@ -686,6 +737,11 @@ fn cwd_poison_positions(root: Node<'_>, src: &str) -> Vec<CwdPoison> {
         }
     }
     positions
+}
+
+/// Whether the script has an in-scope `cd`/`pushd`/`popd` (relative operands then unpinnable).
+pub(crate) fn script_has_cwd_change(root: Node<'_>, src: &str) -> bool {
+    !cwd_poison_positions(root, src).is_empty()
 }
 
 /// Whether an operand runs after a cwd change in its nearest execution scope.
@@ -1109,7 +1165,7 @@ fn special_file_operands(program: &str, words: &[String]) -> Vec<(String, ShellF
 fn shell_access(mode: ShellFileMode, path: String) -> AccessKind {
     match mode {
         ShellFileMode::Read => AccessKind::Read(Some(path)),
-        ShellFileMode::Write => AccessKind::Edit(path),
+        ShellFileMode::Write | ShellFileMode::Create => AccessKind::Edit(path),
     }
 }
 
@@ -1153,10 +1209,16 @@ fn shell_path_command_operands<'a>(
                     .collect(),
             )
         }
-        "rm" | "rmdir" | "mkdir" | "touch" => Some(
+        "rm" | "rmdir" => Some(
             shell_file_candidates(words)
                 .into_iter()
                 .map(|c| (c, ShellFileMode::Write))
+                .collect(),
+        ),
+        p if is_creation_program(p) => Some(
+            shell_file_candidates(words)
+                .into_iter()
+                .map(|c| (c, ShellFileMode::Create))
                 .collect(),
         ),
         // `uniq [INPUT [OUTPUT]]`: a 2nd positional is the output file (Write);
@@ -1657,10 +1719,22 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let home_path = home.path();
         for (file, reason) in [
-            ("config.toml", ProtectedEditReason::GrokConfig),
-            ("managed_config.toml", ProtectedEditReason::GrokConfig),
-            ("requirements.toml", ProtectedEditReason::GrokConfig),
-            ("sandbox.toml", ProtectedEditReason::GrokSandbox),
+            (
+                xai_grok_config::USER_CONFIG_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::MANAGED_CONFIG_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::REQUIREMENTS_FILENAME,
+                ProtectedEditReason::GrokConfig,
+            ),
+            (
+                xai_grok_config::SANDBOX_CONFIG_FILENAME,
+                ProtectedEditReason::GrokSandbox,
+            ),
         ] {
             let path = home_path.join(file);
             let components = [file];
@@ -1671,19 +1745,21 @@ mod tests {
             );
         }
         // Same file names elsewhere (or with no resolvable home) stay ordinary.
-        let elsewhere = home_path.join("sub").join("sandbox.toml");
+        let elsewhere = home_path
+            .join("sub")
+            .join(xai_grok_config::SANDBOX_CONFIG_FILENAME);
         assert_eq!(
             protected_grok_config_file_with_home(
                 &elsewhere,
-                &["sub", "sandbox.toml"],
+                &["sub", xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 Some(home_path)
             ),
             None
         );
         assert_eq!(
             protected_grok_config_file_with_home(
-                &home_path.join("sandbox.toml"),
-                &["sandbox.toml"],
+                &home_path.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
+                &[xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 None
             ),
             None
@@ -1707,8 +1783,8 @@ mod tests {
         let physical_home = resolve_following_symlinks(&real_home, 0).unwrap();
         assert_eq!(
             protected_grok_config_file_with_home(
-                &physical_home.join("sandbox.toml"),
-                &["sandbox.toml"],
+                &physical_home.join(xai_grok_config::SANDBOX_CONFIG_FILENAME),
+                &[xai_grok_config::SANDBOX_CONFIG_FILENAME],
                 Some(&link)
             ),
             Some(ProtectedEditReason::GrokSandbox)

@@ -668,6 +668,21 @@ async fn assistant_response_push_does_not_bump_estimated_delta() {
 }
 
 #[tokio::test]
+async fn provider_counted_model_output_persists_without_bumping_estimate() {
+    let h = TestHarness::new();
+    h.handle.record_token_usage(100_000);
+    h.handle.push_model_output(ConversationItem::Reasoning(
+        xai_grok_sampling_types::synthesized_reasoning_item("r".repeat(4_000)),
+    ));
+
+    assert!(matches!(
+        h.handle.get_conversation().await.as_slice(),
+        [ConversationItem::Reasoning(_)]
+    ));
+    assert_eq!(h.handle.get_estimated_total_tokens().await, 100_000);
+}
+
+#[tokio::test]
 async fn estimated_tokens_resets_on_truncate() {
     let mut h = TestHarness::new();
     h.handle.record_token_usage(100_000);
@@ -1077,20 +1092,59 @@ async fn compaction_reseed_without_provider_count_matches_plain_estimate() {
 }
 
 #[tokio::test]
-async fn non_compaction_replace_does_not_carry_overhead() {
+async fn non_compaction_replace_carries_confirmed_total() {
+    // Estimates run high vs the provider count (retained reasoning never
+    // reaches the wire): a rewind/mode-switch/goal-prune replace must scale
+    // from the confirmed count, not reseed to the raw estimate.
     let h = TestHarness::new();
     h.handle
         .push_user_message(ConversationItem::user("x".repeat(4000)));
-    h.handle.record_token_usage(51_000);
+    h.handle.record_token_usage(500);
+    // Estimate at last response = 1_000, confirmed = 500 → ratio 0.5.
 
     h.handle
         .replace_conversation(vec![ConversationItem::user("q".repeat(4000))]);
 
     let total = h.handle.get_total_tokens().await;
     assert_eq!(
-        total, 1_000,
-        "non-compaction replace (e.g. rewind) keeps the plain estimate"
+        total, 500,
+        "same-size replace carries the provider-confirmed count"
     );
+}
+
+#[tokio::test]
+async fn replace_never_increases_total_tokens() {
+    // A growing replace (harness rebuild injecting AGENTS.md) is capped at the
+    // confirmed total; the brief under-count self-heals on the next usage.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.record_token_usage(1_500);
+
+    h.handle
+        .replace_conversation(vec![ConversationItem::user("q".repeat(40_000))]);
+
+    assert_eq!(h.handle.get_total_tokens().await, 1_500);
+}
+
+#[tokio::test]
+async fn truncate_scales_from_confirmed_total() {
+    // Rewind sibling path: `TruncateToPromptIndex` must use the same carry as
+    // `replace_conversation`.
+    let h = TestHarness::new();
+    h.handle
+        .push_user_message(ConversationItem::user("x".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle
+        .push_user_message(ConversationItem::user("y".repeat(4000)));
+    h.handle.increment_prompt_index();
+    h.handle.record_token_usage(1_000);
+    // Estimate at last response = 2_000, confirmed = 1_000 → ratio 0.5.
+
+    h.handle.truncate_to_prompt_index(1).await;
+
+    // Keeps the first user item (raw estimate 1_000) → scaled to 500.
+    assert_eq!(h.handle.get_total_tokens().await, 500);
 }
 
 #[tokio::test]
@@ -1576,6 +1630,34 @@ async fn build_request_includes_all_messages() {
     assert_eq!(request.items.len(), 2);
     assert_eq!(request.x_grok_conv_id, Some("conv-1".to_string()));
     assert_eq!(request.x_grok_req_id, Some("req-1".to_string()));
+}
+
+#[tokio::test]
+async fn build_request_projects_agent_message_for_model_without_mutating_history() {
+    let raw = format!(
+        "{}\npayload starts with the exact label",
+        crate::compaction_utils::AGENT_MESSAGE_MODEL_LABEL
+    );
+    let raw_item = ConversationItem::agent_message(&raw);
+    let raw_bytes = serde_json::to_vec(&raw_item).unwrap();
+    let h = TestHarness::with_conversation(vec![raw_item]);
+
+    let request = h
+        .handle
+        .build_request(vec![], None, false, None, "c".into(), "r".into())
+        .await
+        .unwrap();
+    assert_eq!(
+        request.items[0].text_content(),
+        format!(
+            "{}\n{raw}",
+            crate::compaction_utils::AGENT_MESSAGE_MODEL_LABEL
+        )
+    );
+
+    let persisted = h.handle.get_conversation().await;
+    assert_eq!(persisted[0].text_content(), raw);
+    assert_eq!(serde_json::to_vec(&persisted[0]).unwrap(), raw_bytes);
 }
 
 #[tokio::test]

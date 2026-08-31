@@ -1,7 +1,9 @@
-//! Session-level telemetry helpers: permission analytics, hook/skill labels, harness snapshot.
+//! Session-level telemetry helpers: product analytics and harness snapshots.
 
+mod active_agent_message;
 mod permission;
 
+pub(crate) use active_agent_message::*;
 pub(crate) use permission::*;
 
 use xai_grok_telemetry::events::SessionHarness;
@@ -131,6 +133,7 @@ pub(crate) struct SessionHarnessMetrics {
     pub mcp_server_names: Vec<String>,
     pub lsp_server_names: Vec<String>,
     pub memory_enabled: bool,
+    pub memory_retrieval_mode: xai_grok_telemetry::events::MemoryRetrievalMode,
     pub auto_update: Option<bool>,
     pub cwd: String,
     /// Filled from the built agent's bridge so `into_event` doesn't re-walk the disk.
@@ -201,6 +204,7 @@ impl SessionHarnessMetrics {
             hook_names,
             agents_md_dir_names,
             memory_enabled: self.memory_enabled,
+            memory_retrieval_mode: self.memory_retrieval_mode,
             // Same signal `SessionNew` carries; recomputed here because this
             // event is built off-thread, after spawn (cheap: repo discovery).
             is_git_repo: xai_grok_telemetry::context::collect_git_context(&self.cwd).is_git_repo,

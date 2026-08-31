@@ -8,7 +8,6 @@ use crate::auth::{AuthManager, GrokAuth, GrokComConfig, run_auth_flow};
 use crate::leader::protocol::InternalMethod;
 use crate::util::grok_home;
 use agent_client_protocol as acp;
-use dirs;
 use parking_lot::Mutex;
 use std::pin::Pin;
 use std::rc::Rc;
@@ -99,6 +98,7 @@ const LEADER_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(15);
 ///
 /// This is extracted as a standalone function so it can be unit-tested
 /// independently from the full leader infrastructure.
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) async fn run_auto_update_checker(
     config: LeaderAutoUpdateConfig,
     agent_busy: Arc<AtomicBool>,
@@ -247,6 +247,7 @@ where
 fn register_fs_watch_runtime() {
     xai_fsnotify::set_runtime_handle(tokio::runtime::Handle::current());
 }
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_stdio_agent(
     agent_config: &AgentConfig,
     prefetched_models: Option<IndexMap<String, ModelEntry>>,
@@ -319,9 +320,11 @@ pub async fn run_stdio_agent(
         })
         .await;
     crate::terminal::pty_session::close_all().await;
+    xai_grok_telemetry::session_ctx::drain_at_process_exit().await;
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     result
 }
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_headless(
     agent_config: &AgentConfig,
     reauthenticate: bool,
@@ -746,6 +749,7 @@ pub fn apply_otel_config(auth_manager: &AuthManager, grok_com_config: &GrokComCo
 /// * `relay_on_demand` - If true, defer the grok.com relay WebSocket until the
 ///   first headless IPC client registers; if false (default), connect eagerly at
 ///   startup; a session acquired later arms it via [`DeferredRelayArm`].
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_leader(
     agent_config: &AgentConfig,
     no_exit_on_disconnect: bool,
@@ -1117,7 +1121,7 @@ pub async fn run_leader(
             let mut watch_paths = crate::config::find_project_configs(&cwd_for_watcher);
             watch_paths
                 .extend(crate::util::config::mcp_json_candidate_paths(&cwd_for_watcher));
-            if let Some(home) = dirs::home_dir() {
+            if let Some(home) = xai_dirs::home_dir() {
                 watch_paths.push(home.join(".claude.json"));
             }
             let auth_scope = agent_config.grok_com_config.auth_scope();
@@ -1157,7 +1161,7 @@ pub async fn run_leader(
                         }
                     });
                 }
-                let initial_config = crate::config::load_effective_config()
+                let initial_config = crate::config::load_from_disk()
                     .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
                 let reloader = crate::config::reloader::ConfigReloader::new(
                     grok_home::grok_home(),
@@ -1166,8 +1170,7 @@ pub async fn run_leader(
                     auth_scope,
                     None,
                     config_update_tx,
-                    agent_config.cli_experimental_memory,
-                    agent_config.cli_no_memory,
+                    agent_config.memory_enabled_override,
                 );
                 tokio::spawn(reloader.run(events_rx, cancel_clone.clone()));
                 Some(watcher)
@@ -1428,6 +1431,7 @@ mod tests {
     }
     /// Mock relay WS server: counts accepted WebSocket connections and holds
     /// each open so the relay loop doesn't immediately reconnect.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn spawn_mock_relay_server() -> (std::net::SocketAddr, Arc<AtomicU32>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1530,6 +1534,7 @@ mod tests {
         );
     }
     /// Wait until at least one relay connection is accepted, or panic.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn wait_for_connection(count: &Arc<AtomicU32>, context: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while count.load(Ordering::SeqCst) == 0 {
@@ -1548,6 +1553,7 @@ mod tests {
     /// it means the agent never registers with the backend ("No online
     /// agents") even though the box is healthy.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn eager_relay_connects_without_any_ipc_client() {
         let (addr, count) = spawn_mock_relay_server().await;
         let config = test_relay_config(addr);
@@ -1586,6 +1592,7 @@ mod tests {
     /// client), the relay must stay off until the first headless registration
     /// flips the demand watch, then connect.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn on_demand_relay_waits_for_headless_demand_signal() {
         let (addr, count) = spawn_mock_relay_server().await;
         let config = test_relay_config(addr);
@@ -1627,6 +1634,7 @@ mod tests {
     /// hand the parts back (not consume them) for a non-eligible token, so
     /// a later eligible one can still arm.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn deferred_arm_connects_relay_when_auth_appears() {
         let (addr, count) = spawn_mock_relay_server().await;
         let cancel = CancellationToken::new();
@@ -1691,6 +1699,7 @@ mod tests {
     /// a relay-eligible session to auth.json, the config watcher emits
     /// `ConfigUpdate::Auth`, and that arms the deferred relay.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn cold_mint_auth_write_arms_deferred_relay() {
         use crate::config::reloader::{ConfigReloader, ConfigUpdate, hash_auth_key};
         let (addr, _count) = spawn_mock_relay_server().await;
@@ -1721,8 +1730,7 @@ mod tests {
             scope,
             None,
             tx,
-            false,
-            false,
+            None,
         );
         reloader.reload_auth().unwrap();
         let ConfigUpdate::Auth(minted) = rx
@@ -1797,6 +1805,7 @@ mod tests {
         assert_eq!(msg["method"], "_x.ai/internal/auth_cleared");
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_cancels_when_update_available_and_agent_idle() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
@@ -1816,6 +1825,7 @@ mod tests {
         assert!(cancel.is_cancelled(), "cancel token should be triggered");
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_defers_when_agent_busy() {
         let agent_busy = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
@@ -1837,6 +1847,7 @@ mod tests {
         let _ = checker.await;
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_no_cancel_when_no_update_available() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
@@ -1858,6 +1869,7 @@ mod tests {
         let _ = checker.await;
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_cancels_after_agent_becomes_idle() {
         let agent_busy = Arc::new(AtomicBool::new(true));
         let cancel = CancellationToken::new();
@@ -1887,6 +1899,7 @@ mod tests {
         );
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_stops_when_externally_cancelled() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
@@ -1906,6 +1919,7 @@ mod tests {
             .expect("checker task should not panic");
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_calls_check_fn_multiple_times() {
         let call_count = Arc::new(AtomicU32::new(0));
         let call_count_clone = call_count.clone();
@@ -1940,6 +1954,7 @@ mod tests {
         let _ = checker.await;
     }
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_cancels_during_hanging_check_fn() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();
@@ -1966,6 +1981,7 @@ mod tests {
     /// must also defer on the agent-derived activity signal (running turn,
     /// pending interaction, or live subagent).
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_defers_when_agent_activity_busy() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let activity = crate::agent::activity::AgentActivity::default();
@@ -1995,6 +2011,7 @@ mod tests {
     /// A permanently-busy signal must not pin the leader to an old binary
     /// forever: after MAX_AUTO_UPDATE_BUSY_DEFERRALS the update proceeds.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_forces_shutdown_after_deferral_limit() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let activity = crate::agent::activity::AgentActivity::default();
@@ -2019,6 +2036,7 @@ mod tests {
     /// the checker must ask every registered session actor to shut down and
     /// wait for it to exit, so buffered state is flushed to disk.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_flushes_sessions_before_cancel() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let activity = crate::agent::activity::AgentActivity::default();
@@ -2063,6 +2081,7 @@ mod tests {
     /// sends `ShutdownReason::AutoUpdate` via the `shutdown_tx` channel BEFORE
     /// cancelling the token, so the IPC server broadcasts the correct reason.
     #[tokio::test]
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auto_update_sets_shutdown_reason_auto_update() {
         let agent_busy = Arc::new(AtomicBool::new(false));
         let cancel = CancellationToken::new();

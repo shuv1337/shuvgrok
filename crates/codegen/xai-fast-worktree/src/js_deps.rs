@@ -211,6 +211,9 @@ mod tests {
         let first = ensure_js_deps(dir.path()).unwrap();
         assert!(matches!(first, EnsureJsDepsOutcome::TrustedExisting { .. }));
         let second = ensure_js_deps(dir.path()).unwrap();
-        assert!(matches!(second, EnsureJsDepsOutcome::SkippedStampMatch { .. }));
+        assert!(matches!(
+            second,
+            EnsureJsDepsOutcome::SkippedStampMatch { .. }
+        ));
     }
 }

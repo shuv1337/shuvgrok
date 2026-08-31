@@ -1,11 +1,21 @@
 use super::attempt_runner::{
-    OneTurnAttemptInput, OneTurnAttemptOutcome, OneTurnTraceCapture, OneTurnUsageInput,
-    capture_and_fold_one_turn_usage, run_one_turn_attempt,
+    InitialChildPromptReadiness, OneTurnAttemptInput, OneTurnAttemptOutcome, OneTurnTraceCapture,
+    OneTurnUsageInput, capture_and_fold_one_turn_usage, run_one_turn_attempt,
+    wait_initial_child_prompt_readiness,
+};
+use super::prompt_turn_receipt::{
+    ACTIVE_MESSAGE_RECEIPT_CAPACITY, AdmissionSettlement, FinalPromptTurnReceipt,
+    PromptTurnReceiptDisposition, PromptTurnReceiptDrain, PromptTurnReceiptOutcome,
 };
 use super::*;
 use crate::upload::trace::PromptMetadataParams;
 use xai_grok_sampling_types::ReasoningEffort;
+use xai_grok_telemetry::region::Parent;
+use xai_grok_telemetry::subagent_spawn::{SubagentSpawnPhase, phase_region};
+use xai_grok_telemetry::{instrument_task, region};
 use xai_grok_tools::implementations::{grok_build, opencode};
+const INITIAL_PROMPT_ADMISSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const CHILD_COMPLETION_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) fn task_model_override_error(
     requested: Option<&str>,
     provenance: ModelOverrideProvenance,
@@ -24,8 +34,6 @@ pub(super) fn task_model_override_error(
         crate::auth::LiveProviders::detect(&crate::util::grok_home::grok_home()),
     )
 }
-/// Runtime adapter for one shell child. Shared lifecycle state is owned by the
-/// `xai-grok-tools` coordinator actor and reached only through `reporter`.
 #[tracing::instrument(
     name = "subagent.handle_request",
     skip_all,
@@ -38,7 +46,7 @@ pub(super) fn task_model_override_error(
 pub(crate) async fn run_shell_child(
     run: grok_build::task::coordinator::ChildRunRequest<ShellChildRuntime>,
     mut ctx: SubagentSpawnContext,
-    gateway: &GatewaySender,
+    gateway: GatewaySender,
 ) -> ChildRunOutput<ShellCompletionData> {
     let grok_build::task::coordinator::ChildRunRequest {
         mut request,
@@ -48,6 +56,12 @@ pub(crate) async fn run_shell_child(
         session_running,
     } = run;
     let start = std::time::Instant::now();
+    let spawn_timer = xai_grok_telemetry::subagent_spawn::SubagentSpawnTimer::new_shared();
+    if let Some(queued) = queued_for {
+        spawn_timer.record(SubagentSpawnPhase::QueueWait, queued);
+    }
+    let spawn_prepare_span = phase_region(SubagentSpawnPhase::SpawnPrepare);
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::CHILD_ENTER);
     let mut completion_data = ShellCompletionData::from_context(&ctx);
     if request.owner.is_workflow() && cancel_token.is_cancelled() {
         return child_run_output(
@@ -288,7 +302,11 @@ pub(crate) async fn run_shell_child(
         let subagent_id = request.id.clone();
         let creation_mode: xai_fast_worktree::CreationMode = ctx.worktree_type.into();
         let btrfs_delegate = crate::session::worktree::btrfs_delegate_from_env();
-        match tokio::task::spawn_blocking(move || {
+        let worktree_create_span = region!(
+            "subagent_spawn.worktree_create",
+            Parent::Explicit(spawn_prepare_span.span())
+        );
+        let created = match tokio::task::spawn_blocking(move || {
             crate::session::worktree::create_subagent_isolation(
                 &source_repo,
                 &dest,
@@ -326,7 +344,9 @@ pub(crate) async fn run_shell_child(
                 );
                 None
             }
-        }
+        };
+        worktree_create_span.close();
+        created
     } else {
         None
     };
@@ -581,9 +601,14 @@ pub(crate) async fn run_shell_child(
         let bucket = bucket_url.clone();
         let method = upload_method.clone();
         let auth_for_spawn = ctx.auth_manager.clone();
-        tokio::spawn(async move {
-            upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
-        });
+        tokio::spawn(instrument_task!(
+            debug,
+            "subagent.metadata_upload",
+            Parent::Root,
+            async move {
+                upload_subagent_metadata(&gcs_meta, &bucket, method, auth_for_spawn).await;
+            }
+        ));
     }
     let gcs_upload_ctx = GcsUploadContext {
         bucket_url: ctx.gcs_bucket_url.clone(),
@@ -602,7 +627,7 @@ pub(crate) async fn run_shell_child(
         depth: child_depth,
     };
     emit_subagent_notification(
-        gateway,
+        &gateway,
         &ctx.parent_session_id,
         SessionUpdate::SubagentSpawned {
             subagent_id: subagent_id.clone(),
@@ -852,14 +877,22 @@ pub(crate) async fn run_shell_child(
             }
         }
     }
-    let agent_mcp_servers: Vec<_> = if !agent_owned_mcp_servers_allowed(is_plugin_agent) {
-        if !definition.mcp_servers.is_empty() {
-            tracing::warn!(
-                agent = %definition.name,
-                plugin = ?definition.plugin_name,
-                "ignoring mcpServers on plugin agent (not supported for security)"
-            );
-        }
+    let agent_mcp_servers: Vec<_> = if definition.mcp_servers.is_empty() {
+        vec![]
+    } else if is_plugin_agent {
+        tracing::warn!(
+            agent = %definition.name,
+            plugin = ?definition.plugin_name,
+            "ignoring mcpServers on plugin agent (not supported for security)"
+        );
+        vec![]
+    } else if !crate::agent::folder_trust::agent_inline_hooks_allowed(definition.scope, || {
+        crate::agent::folder_trust::project_scope_allowed(&ctx.parent_cwd)
+    }) {
+        tracing::warn!(
+            agent = %definition.name,
+            "ignoring mcpServers on untrusted project agent (folder not trusted; re-run with --trust)"
+        );
         vec![]
     } else {
         definition
@@ -955,6 +988,11 @@ pub(crate) async fn run_shell_child(
         );
     }
     let mcp_owned_count = agent_mcp_servers.len() as u32;
+    let _active = xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.enter();
+    debug_assert!(
+        xai_grok_telemetry::activity::SUBAGENTS_ACTIVE.get() >= 1,
+        "SubagentLaunched must stamp a self-inclusive count"
+    );
     xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentLaunched {
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
@@ -980,6 +1018,13 @@ pub(crate) async fn run_shell_child(
             agent_name: Some(definition.name.clone()),
             reasoning_effort: Some(effective_sampling_config.reasoning_effort),
         });
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_SPAWN);
+    spawn_timer.record(SubagentSpawnPhase::SpawnPrepare, start.elapsed());
+    spawn_prepare_span.close();
+    let session_bootstrap_span = phase_region(SubagentSpawnPhase::SessionBootstrap);
+    let spawn_phase_parent = session_bootstrap_span.span().clone();
+    let bootstrap_started_at = std::time::Instant::now();
+    let pins = ctx.compaction_pins_for_child(&definition.user_message_template);
     let spawn_result = session::spawn_session_on_thread(
         child_session_info,
         gateway.clone(),
@@ -1014,10 +1059,10 @@ pub(crate) async fn run_shell_child(
         xai_grok_workspace::permission::ClientType::Generic,
         ctx.resolve_auto_compact_threshold_percent(&subagent_model_id),
         xai_grok_agent::DEFAULT_SYSTEM_PROMPT_LABEL.to_string(),
-        xai_chat_state::CompactionMode::Summary,
+        pins.mode,
         ctx.resolve_compaction_verbatim_input(),
         ctx.resolve_compaction_tool_choice(),
-        false,
+        pins.two_pass,
         None,
         None,
         std::sync::Arc::new(parking_lot::Mutex::new(
@@ -1025,6 +1070,7 @@ pub(crate) async fn run_shell_child(
         )),
         false,
         subagent_fs_watch,
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         None,
         None,
         None,
@@ -1079,17 +1125,20 @@ pub(crate) async fn run_shell_child(
         None,
         ctx.inference_idle_timeout_secs,
         None,
+        ctx.resolve_subagent_rate_limit_max_attempts(&subagent_model_id),
         ctx.web_search_sampling_config.clone(),
         ctx.web_fetch_config.clone(),
         ctx.image_gen_config.clone(),
         ctx.video_gen_config.clone(),
         ctx.app_builder_deployer_config.clone(),
         ctx.write_file_enabled,
+        false,
         ctx.goal_enabled,
         ctx.background_workflows_enabled,
         true,
         ctx.subagents_max_depth,
         ctx.workflow_max_concurrent_agents,
+        ctx.media_gen_batch_limits,
         ctx.ask_user_question_enabled,
         ctx.client_hooks.clone(),
         None,
@@ -1102,7 +1151,7 @@ pub(crate) async fn run_shell_child(
         ctx.backend_tools_enabled,
         ctx.respect_gitignore,
         ctx.path_not_found_hints,
-        ctx.resolve_tool_params_json(),
+        Default::default(),
         ctx.plugin_registry.clone(),
         None,
         ctx.models_manager.clone(),
@@ -1129,8 +1178,20 @@ pub(crate) async fn run_shell_child(
             None
         },
         false,
+        Some(xai_grok_telemetry::subagent_spawn::SpawnPhaseContext {
+            timer: spawn_timer.clone(),
+            parent: spawn_phase_parent,
+        }),
+        Some(ctx.subagent_sampling_semaphore.clone()),
     )
     .await;
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::SESSION_UP);
+    spawn_timer.record(
+        SubagentSpawnPhase::SessionBootstrap,
+        bootstrap_started_at.elapsed(),
+    );
+    session_bootstrap_span.close();
+    let session_ready_at = std::time::Instant::now();
     let (child_handle, mut permission_rx, _system_prompt, child_thread) = match spawn_result {
         Ok(r) => r,
         Err(e) => {
@@ -1146,50 +1207,15 @@ pub(crate) async fn run_shell_child(
             return child_run_output(result, completion_data, None);
         }
     };
-    let promoted = reporter
-        .started(StartedChild {
-            child_session_id: child_session_id.0.to_string(),
-            persona: effective_runtime.persona.clone(),
-            resumed_from: request.resume_from.clone(),
-            child_cwd: tracker_child_cwd,
-            worktree_path: worktree_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().into_owned()),
-            effective_model_id: tracker_model_id.clone(),
-            definition_background,
-            control: ShellChildRuntime {
-                child_handle: child_handle.clone(),
-                _child_thread: child_thread,
-            },
-        })
-        .await;
-    if !promoted {
-        ctx.workspace_ops
-            .end_local_session(child_session_id.0.as_ref());
-        let result = cancel_pending_shell_child(
-            &child_handle.cmd_tx,
-            &subagent_id,
-            &child_session_id,
-            &subagent_meta_dir,
-            worktree_path.as_deref(),
-            worktree_freshly_created,
-            start.elapsed().as_millis() as u64,
-            &gcs_upload_ctx,
-        )
-        .await;
-        return child_run_output(result, completion_data, None);
-    }
-    spawn_progress_publisher(
-        child_handle.signals_handle.clone(),
-        gateway.clone(),
-        ctx.parent_session_id.clone(),
-        request.id.clone(),
-        child_session_id.0.to_string(),
-        start,
+    let ready_to_first_turn_span = phase_region(SubagentSpawnPhase::ReadyToFirstTurn);
+    let (receipt_sink, receipt_stream) = mpsc::channel(ACTIVE_MESSAGE_RECEIPT_CAPACITY);
+    let receipt_drain = PromptTurnReceiptDrain::start(
+        receipt_stream,
+        child_handle.cmd_tx.clone(),
         cancel_token.clone(),
-        goal_tick_cmd_tx(ctx.goal_enabled, ctx.parent_cmd_tx.as_ref()),
     );
-    let attempt = run_one_turn_attempt(OneTurnAttemptInput {
+    let (prompt_admitted, prompt_admitted_rx) = oneshot::channel();
+    let mut attempt = Box::pin(run_one_turn_attempt(OneTurnAttemptInput {
         child_handle: &child_handle,
         request: &request,
         worktree_path: worktree_path.as_deref(),
@@ -1199,12 +1225,101 @@ pub(crate) async fn run_shell_child(
         gcs_upload_method: ctx.gcs_upload_method.as_ref(),
         cancel_token: cancel_token.clone(),
         child_run_started_at: start,
-    })
+        prompt_admitted,
+    }));
+    let readiness = wait_initial_child_prompt_readiness(
+        cancel_token.cancelled(),
+        prompt_admitted_rx,
+        &mut attempt,
+        INITIAL_PROMPT_ADMISSION_TIMEOUT,
+    )
     .await;
+    let unpromoted_disposition = readiness.unpromoted_disposition();
+    let mut completed_before_ack = None;
+    let promoted = match readiness {
+        InitialChildPromptReadiness::Admitted => {
+            reporter
+                .started(StartedChild {
+                    child_session_id: child_session_id.0.to_string(),
+                    persona: effective_runtime.persona.clone(),
+                    resumed_from: request.resume_from.clone(),
+                    child_cwd: tracker_child_cwd,
+                    worktree_path: worktree_path
+                        .as_ref()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                    effective_model_id: tracker_model_id.clone(),
+                    definition_background,
+                    control: ShellChildRuntime {
+                        child_cmd_tx: child_handle.cmd_tx.clone(),
+                        message_delivery: child_handle.message_delivery(),
+                        active_message_target_session_id: child_session_id.0.to_string(),
+                        child_signals: child_handle.signals_handle.clone(),
+                        _child_thread: None,
+                        receipt_sink,
+                        #[cfg(test)]
+                        force_queue_envelope: false,
+                        active_message_parent_session_id: ctx.parent_session_id.clone(),
+                        active_message_parent_prompt_index: ctx
+                            .active_message_parent_prompt_index
+                            .clone(),
+                    },
+                })
+                .await
+        }
+        InitialChildPromptReadiness::AttemptCompleted(outcome) => {
+            drop(receipt_sink);
+            completed_before_ack = Some(outcome);
+            false
+        }
+        InitialChildPromptReadiness::Cancelled | InitialChildPromptReadiness::TimedOut => {
+            drop(receipt_sink);
+            false
+        }
+    };
+    if !promoted && completed_before_ack.is_none() {
+        ready_to_first_turn_span.close();
+        let result = cancel_pending_shell_child(
+            &child_handle.cmd_tx,
+            child_thread,
+            &ctx.workspace_ops,
+            &subagent_id,
+            &child_session_id,
+            &subagent_meta_dir,
+            worktree_path.as_deref(),
+            worktree_freshly_created,
+            start.elapsed().as_millis() as u64,
+            &gcs_upload_ctx,
+            UNPROMOTED_SESSION_THREAD_EXIT_TIMEOUT,
+            unpromoted_disposition,
+        )
+        .await;
+        return child_run_output(result, completion_data, None);
+    }
+    let _child_thread = child_thread;
+    let _progress_publisher = spawn_progress_publisher(
+        child_handle.signals_handle.clone(),
+        gateway.clone(),
+        ctx.parent_session_id.clone(),
+        request.id.clone(),
+        child_session_id.0.to_string(),
+        start,
+        cancel_token.clone(),
+        goal_tick_cmd_tx(ctx.goal_enabled, ctx.parent_cmd_tx.as_ref()),
+    );
+    spawn_timer.record(
+        SubagentSpawnPhase::ReadyToFirstTurn,
+        session_ready_at.elapsed(),
+    );
+    ready_to_first_turn_span.close();
+    let attempt = match completed_before_ack {
+        Some(outcome) => outcome,
+        None => attempt.as_mut().await,
+    };
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::TURN_DONE);
     let OneTurnAttemptOutcome {
         mut result,
         trace,
-        cancellation_may_hide_usage,
+        mut cancellation_may_hide_usage,
     } = attempt;
     let OneTurnTraceCapture {
         before_copy_rx,
@@ -1212,6 +1327,144 @@ pub(crate) async fn run_shell_child(
         turn_started_at,
         turn_token_totals,
     } = trace;
+    let admission = if promoted && !reporter.finalizing().await {
+        AdmissionSettlement::Uncertain
+    } else {
+        AdmissionSettlement::Settled
+    };
+    let receipt_settlement = receipt_drain.settle(admission).await;
+    let receipt_disposition = receipt_settlement.disposition;
+    let mut final_prompt_id = child_prompt_id;
+    let mut final_turn_tokens = turn_token_totals;
+    let mut final_receipt = None;
+    let mut final_receipt_telemetry = None;
+    let mut is_final_receipt_closed = false;
+    if let Some(FinalPromptTurnReceipt {
+        prompt_id,
+        outcome,
+        telemetry,
+    }) = receipt_settlement.final_receipt
+    {
+        final_prompt_id = prompt_id;
+        final_receipt_telemetry = Some(telemetry);
+        match outcome {
+            PromptTurnReceiptOutcome::Settled(receipt) => {
+                is_final_receipt_closed = receipt.is_err();
+                final_receipt = Some(*receipt);
+            }
+            PromptTurnReceiptOutcome::TimedOut => {
+                result.success = false;
+                result.cancelled = true;
+                result.error = Some("Subagent receipt settlement timed out".to_string());
+                result.output_usage_incomplete = true;
+                cancellation_may_hide_usage = true;
+            }
+        }
+    }
+    if let Some(Ok(Ok(crate::session::commands::PromptTurnOk {
+        turn_snapshot: Some(snapshot),
+        ..
+    }))) = final_receipt.as_ref()
+    {
+        final_turn_tokens = Some((
+            snapshot.turn_input_tokens,
+            snapshot.turn_cached_input_tokens,
+            snapshot.turn_output_tokens,
+        ));
+    }
+    let final_text = if final_receipt.is_some() {
+        child_handle
+            .chat_state_handle
+            .get_last_assistant_text_in_turn()
+            .await
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    match receipt_disposition {
+        PromptTurnReceiptDisposition::Completed => {
+            if let Some(receipt) = final_receipt {
+                let empty_summary = String::new;
+                let max_turns_summary = |_| String::new();
+                let folded = super::prompt_turn_result::reduce_prompt_turn_result(
+                    super::prompt_turn_result::PromptTurnResultInput {
+                        result,
+                        turn_result: receipt,
+                        mode: super::prompt_turn_result::PromptTurnResultMode::ParentFollowup,
+                        final_text,
+                        was_cancelled: cancel_token.is_cancelled(),
+                        summaries: super::prompt_turn_result::PromptTurnResultSummaries {
+                            success: &empty_summary,
+                            max_turns: &max_turns_summary,
+                            cancelled: &empty_summary,
+                        },
+                        result_tokens: 0,
+                    },
+                );
+                result = folded.result;
+                cancellation_may_hide_usage |= folded.cancellation_may_hide_usage;
+            }
+        }
+        PromptTurnReceiptDisposition::Cancelled => {
+            result.success = false;
+            result.cancelled = true;
+            result.error = Some("Subagent was cancelled".to_string());
+            result.output = Arc::from(final_text);
+            result.output_usage_incomplete = true;
+            cancellation_may_hide_usage = true;
+        }
+        PromptTurnReceiptDisposition::AdmissionUncertain => {
+            result.success = false;
+            result.cancelled = true;
+            result.error = Some("Active-message admission could not be proven settled".to_string());
+            result.output = Arc::from(final_text);
+            result.output_usage_incomplete = true;
+            cancellation_may_hide_usage = true;
+        }
+        PromptTurnReceiptDisposition::TimedOut => {
+            result.success = false;
+            result.cancelled = true;
+            result.error = Some("Subagent receipt settlement timed out".to_string());
+            result.output = Arc::from(final_text);
+            result.output_usage_incomplete = true;
+            cancellation_may_hide_usage = true;
+        }
+    }
+    let settlement_status = match receipt_disposition {
+        PromptTurnReceiptDisposition::Completed => {
+            crate::session::telemetry::classify_completed_settlement(
+                crate::session::telemetry::ActiveAgentMessageCompletedSettlement {
+                    is_result_success: result.success,
+                    is_result_cancelled: result.cancelled,
+                    is_final_receipt_closed,
+                },
+            )
+        }
+        PromptTurnReceiptDisposition::Cancelled => {
+            crate::session::telemetry::ActiveAgentMessageSettlementStatus::Cancelled
+        }
+        PromptTurnReceiptDisposition::AdmissionUncertain => {
+            crate::session::telemetry::ActiveAgentMessageSettlementStatus::AdmissionUncertain
+        }
+        PromptTurnReceiptDisposition::TimedOut => {
+            crate::session::telemetry::ActiveAgentMessageSettlementStatus::TimedOut
+        }
+    };
+    crate::session::telemetry::record_settlement(final_receipt_telemetry, settlement_status).await;
+    let trace_token_totals = child_handle
+        .chat_state_handle
+        .try_get_session_usage()
+        .await
+        .ok()
+        .map(|usage| usage.totals);
+    result.tokens_used = trace_token_totals
+        .as_ref()
+        .map(xai_chat_state::UsageTotals::total_tokens)
+        .unwrap_or(0);
+    let (tool_calls, turns) = signals_snapshot_counts(&child_handle).await;
+    result.tool_calls = tool_calls;
+    result.turns = turns;
+    result.duration_ms = start.elapsed().as_millis() as u64;
     if let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
         crate::session::repo_changes::TraceExportConfig {
             bucket_url: gcs_upload_ctx.bucket_url.clone(),
@@ -1241,7 +1494,7 @@ pub(crate) async fn run_shell_child(
         };
         let streaming_partial = crate::upload::turn::take_streaming_partial(
             &child_handle.cmd_tx,
-            child_prompt_id.clone(),
+            final_prompt_id.clone(),
             result.success,
             gcs_upload_ctx.model_id.clone(),
         )
@@ -1303,7 +1556,7 @@ pub(crate) async fn run_shell_child(
             schema_version: GCS_SCHEMA_VERSION.to_string(),
             session_id: child_session_id.0.to_string(),
             turn_number: 0,
-            request_id: child_prompt_id.clone(),
+            request_id: final_prompt_id.clone(),
             turn_started_at: turn_started_at.clone(),
             user_id: subagent_auth.as_ref().map(|a| a.user_id.clone()),
             user_email: subagent_auth.as_ref().and_then(|a| a.email.clone()),
@@ -1333,13 +1586,15 @@ pub(crate) async fn run_shell_child(
             .or_else(|| gcs_upload_ctx.model_id.clone());
         let turn_result_meta = TurnResultMetadata {
             schema_version: "1",
-            request_id: child_prompt_id,
+            request_id: final_prompt_id,
             completed: result.success,
             stop_reason: None,
-            total_tokens: None,
-            input_tokens: turn_token_totals.map(|t| t.0),
-            cached_input_tokens: turn_token_totals.map(|t| t.1),
-            output_tokens: turn_token_totals.map(|t| t.2),
+            total_tokens: trace_token_totals
+                .as_ref()
+                .map(xai_chat_state::UsageTotals::total_tokens),
+            input_tokens: final_turn_tokens.map(|tokens| tokens.0),
+            cached_input_tokens: final_turn_tokens.map(|tokens| tokens.1),
+            output_tokens: final_turn_tokens.map(|tokens| tokens.2),
             error: result.error.clone(),
             finished_at: chrono::Utc::now().to_rfc3339(),
             signals: None,
@@ -1451,7 +1706,7 @@ pub(crate) async fn run_shell_child(
     } else {
         xai_grok_telemetry::events::Outcome::Error
     };
-    xai_grok_telemetry::session_ctx::log_event(xai_grok_telemetry::events::SubagentCompleted {
+    let mut completed = xai_grok_telemetry::events::SubagentCompleted {
         subagent_id: request.id.clone(),
         parent_session_id: request.parent_session_id.clone(),
         owner: telemetry_owner_kind(&request),
@@ -1464,7 +1719,15 @@ pub(crate) async fn run_shell_child(
         } else {
             None
         },
-    });
+        queue_wait_ms: None,
+        spawn_prepare_ms: None,
+        session_bootstrap_ms: None,
+        agent_build_ms: None,
+        tool_setup_ms: None,
+        ready_to_first_turn_ms: None,
+    };
+    spawn_timer.write_event_phases(&mut completed);
+    xai_grok_telemetry::session_ctx::log_event(completed);
     match (
         &ctx.parent_terminal_backend,
         &ctx.parent_notification_handle,
@@ -1510,6 +1773,38 @@ pub(crate) async fn run_shell_child(
         }
         (None, None) => {}
     }
+    {
+        let (respond_to, ack) = oneshot::channel();
+        if child_handle
+            .cmd_tx
+            .send(SessionCommand::FlushComplete { respond_to })
+            .is_ok()
+        {
+            match tokio::time::timeout(CHILD_COMPLETION_FLUSH_TIMEOUT, ack).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        %error,
+                        "child transcript flush failed before completion"
+                    )
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        "child session dropped the transcript flush ack before completion"
+                    )
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        subagent_id = %request.id,
+                        "child transcript flush timed out before completion"
+                    )
+                }
+            }
+        }
+    }
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::FLUSH_DONE);
     let _ = child_handle.cmd_tx.send(SessionCommand::Shutdown(
         crate::session::ShutdownKind::Graceful,
     ));
@@ -1519,58 +1814,16 @@ pub(crate) async fn run_shell_child(
     let mut worktree_removed = false;
     if let Some(ref wt_path) = worktree_path {
         if snapshot_dispose_enabled {
-            let ref_name = format!("refs/grok/subagents/{}", request.id);
-            let source_repo = resolve_subagent_source_repo(&ctx);
-            match crate::session::worktree::snapshot_subagent_worktree(
+            let disposal = dispose_worktree_after_completion(
                 wt_path,
-                &source_repo,
-                &ref_name,
+                &resolve_subagent_source_repo(&ctx),
+                &subagent_meta_dir,
+                &final_status,
+                &request.id,
             )
-            .await
-            {
-                Ok(snapshot_ref) => {
-                    let persisted = update_subagent_meta_snapshot_ref(
-                        &subagent_meta_dir,
-                        &snapshot_ref,
-                        &final_status,
-                    );
-                    if persisted {
-                        disposed_snapshot_ref = Some(snapshot_ref);
-                        match crate::session::worktree::remove_subagent_worktree(wt_path).await {
-                            Ok(()) => {
-                                worktree_removed = true;
-                                tracing::info!(
-                                    subagent_id = %request.id,
-                                    worktree_path = %wt_path.display(),
-                                    "snapshotted and removed subagent worktree"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    subagent_id = %request.id,
-                                    worktree_path = %wt_path.display(),
-                                    error = %e,
-                                    "snapshotted subagent worktree but removal failed; ref persisted for resume"
-                                )
-                            }
-                        }
-                    } else {
-                        tracing::warn!(
-                            subagent_id = %request.id,
-                            worktree_path = %wt_path.display(),
-                            "snapshot_ref not persisted; preserving worktree for resume"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        subagent_id = %request.id,
-                        worktree_path = %wt_path.display(),
-                        error = %e,
-                        "Failed to snapshot subagent worktree; preserving for review"
-                    );
-                }
-            }
+            .await;
+            worktree_removed = disposal.worktree_removed();
+            disposed_snapshot_ref = disposal.snapshot_ref().map(str::to_owned);
         } else {
             tracing::info!(
                 subagent_id = %request.id,
@@ -1609,5 +1862,133 @@ pub(crate) async fn run_shell_child(
             "error": &result.error,
         })),
     );
+    crate::waterfall::mark(&request.id, crate::waterfall::stage::CHILD_DONE);
     child_run_output(result, completion_data, disposed_snapshot_ref)
+}
+pub(crate) enum Disposal {
+    Kept,
+    Snapshotted {
+        snapshot_ref: String,
+        worktree_removed: bool,
+    },
+}
+impl Disposal {
+    pub(crate) fn worktree_removed(&self) -> bool {
+        matches!(
+            self,
+            Disposal::Snapshotted {
+                worktree_removed: true,
+                ..
+            }
+        )
+    }
+    pub(crate) fn snapshot_ref(&self) -> Option<&str> {
+        match self {
+            Disposal::Kept => None,
+            Disposal::Snapshotted { snapshot_ref, .. } => Some(snapshot_ref),
+        }
+    }
+}
+#[tracing::instrument(skip_all)]
+pub(crate) async fn dispose_worktree_after_completion(
+    worktree: &std::path::Path,
+    source_repo: &std::path::Path,
+    meta_dir: &std::path::Path,
+    final_status: &str,
+    subagent_id: &str,
+) -> Disposal {
+    let ref_name = format!("refs/grok/subagents/{subagent_id}");
+    let snapshot_ref = match crate::session::worktree::snapshot_subagent_worktree(
+        worktree,
+        source_repo,
+        &ref_name,
+    )
+    .await
+    {
+        Ok(snapshot_ref) => snapshot_ref,
+        Err(e) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                error = %e,
+                "Failed to snapshot subagent worktree; preserving for review"
+            );
+            return Disposal::Kept;
+        }
+    };
+    let checked_path = worktree.to_path_buf();
+    let checked_source_repo = source_repo.to_path_buf();
+    let checked_snapshot = snapshot_ref.clone();
+    let reclaim_span = region!("worktree.reclaim_check", Parent::Inherit);
+    let reclaim = tokio::task::spawn_blocking(move || {
+        xai_fast_worktree::reclaimable_after_snapshot(
+            &checked_path,
+            Some(&checked_source_repo),
+            &checked_snapshot,
+        )
+    })
+    .await;
+    reclaim_span.close();
+    match reclaim {
+        Ok(xai_fast_worktree::Reclaim::Now { .. }) => {}
+        Ok(xai_fast_worktree::Reclaim::Keep(reason)) => {
+            tracing::info!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %reason,
+                "subagent worktree kept: removal would not preserve every byte"
+            );
+            return Disposal::Kept;
+        }
+        Ok(xai_fast_worktree::Reclaim::Unnamed(error)) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %error,
+                "the discarded commits were not named; preserving the worktree"
+            );
+            return Disposal::Kept;
+        }
+        Err(error) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                %error,
+                "the safety check did not finish; preserving the worktree"
+            );
+            return Disposal::Kept;
+        }
+    }
+    if !update_subagent_meta_snapshot_ref(meta_dir, &snapshot_ref, final_status) {
+        tracing::warn!(
+            subagent_id = %subagent_id,
+            worktree_path = %worktree.display(),
+            "snapshot_ref not persisted; preserving worktree for resume"
+        );
+        return Disposal::Kept;
+    }
+    let worktree_removed = match crate::session::worktree::remove_subagent_worktree(worktree).await
+    {
+        Ok(()) => {
+            tracing::info!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                "snapshotted and removed subagent worktree"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                subagent_id = %subagent_id,
+                worktree_path = %worktree.display(),
+                error = %e,
+                "snapshotted subagent worktree but removal failed; ref persisted for resume"
+            );
+            false
+        }
+    };
+    Disposal::Snapshotted {
+        snapshot_ref,
+        worktree_removed,
+    }
 }

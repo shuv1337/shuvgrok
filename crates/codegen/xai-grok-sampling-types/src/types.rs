@@ -98,6 +98,8 @@ pub struct ChatCompletionRequest {
     #[serde(skip)]
     pub x_grok_turn_idx: Option<String>,
     #[serde(skip)]
+    pub x_grok_transient_retry: Option<String>,
+    #[serde(skip)]
     pub x_grok_agent_id: Option<String>,
     #[serde(skip)]
     pub x_grok_deployment_id: Option<String>,
@@ -131,6 +133,7 @@ impl ChatCompletionRequest {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -157,6 +160,7 @@ impl ChatCompletionRequest {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -1028,11 +1032,6 @@ impl ApiBackend {
         matches!(self, Self::ChatCompletions | Self::Responses)
     }
 
-    /// Whether replayed reasoning must be stripped. Only the Messages API rejects thinking blocks sent without a top-level `thinking` config.
-    pub fn requires_reasoning_strip(&self) -> bool {
-        matches!(self, Self::Messages)
-    }
-
     /// Whether [`ConversationRequest::prompt_cache_key`] reaches the wire. Only the Responses mapping sends it, so a key set elsewhere is inert.
     ///
     /// [`ConversationRequest::prompt_cache_key`]: crate::conversation::ConversationRequest::prompt_cache_key
@@ -1091,6 +1090,7 @@ pub struct CreateResponseWrapper {
 
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -1113,6 +1113,7 @@ impl CreateResponseWrapper {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,
@@ -1163,6 +1164,7 @@ pub struct MessagesRequestWrapper {
 
     pub x_grok_session_id: Option<String>,
     pub x_grok_turn_idx: Option<String>,
+    pub x_grok_transient_retry: Option<String>,
     pub x_grok_agent_id: Option<String>,
     pub x_grok_deployment_id: Option<String>,
     pub x_grok_user_id: Option<String>,
@@ -1180,6 +1182,7 @@ impl MessagesRequestWrapper {
             x_grok_req_id: None,
             x_grok_session_id: None,
             x_grok_turn_idx: None,
+            x_grok_transient_retry: None,
             x_grok_agent_id: None,
             x_grok_deployment_id: None,
             x_grok_user_id: None,

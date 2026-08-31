@@ -48,8 +48,8 @@ use xai_grok_agent::prompt::context::PromptAudience;
 use xai_grok_agent::prompt::skills::SkillsConfig;
 use xai_grok_agent::{Agent, AgentBuilder, CompactionPolicy, ReminderPolicy};
 use xai_grok_tools::computer::types::{AsyncFileSystem, TerminalBackend};
+use xai_grok_tools::implementations::grok_build::app_builder::AppBuilderDeployerConfig;
 use xai_grok_tools::implementations::grok_build::ask_user_question::types::UserQuestionRequest;
-use xai_grok_tools::implementations::grok_build::deploy_app::AppBuilderDeployerConfig;
 use xai_grok_tools::implementations::grok_build::image_gen::ImageGenConfig;
 use xai_grok_tools::implementations::grok_build::monitor::types::MonitorEventBuffer;
 use xai_grok_tools::implementations::grok_build::task::types::{SubagentEvent, TaskModelValidator};
@@ -101,7 +101,9 @@ pub(crate) struct AgentRebuildSpec {
     pub image_gen_config: ImageGenConfig,
     pub video_gen_config: VideoGenConfig,
     pub app_builder_deployer_config: AppBuilderDeployerConfig,
+    pub media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits,
     pub write_file_enabled: bool,
+    pub active_agent_messages_enabled: bool,
     pub subagents_enabled: bool,
     pub subagent_toggle: HashMap<String, bool>,
     pub background_workflows_enabled: bool,
@@ -122,6 +124,9 @@ pub(crate) struct AgentRebuildSpec {
     pub attribution_callback: Option<xai_grok_tools::SharedAttributionCallback>,
     pub tool_params_json: ResolvedToolParamsJson,
     pub subagent_event_tx: Option<UnboundedSender<SubagentEvent>>,
+    pub subagent_coordinator_sender: Option<
+        xai_grok_tools::implementations::grok_build::task::backend::SubagentCoordinatorSender,
+    >,
     pub monitor_event_buffer: Option<MonitorEventBuffer>,
     pub user_question_tx: UnboundedSender<UserQuestionRequest>,
     pub subagent_depth: u32,
@@ -155,7 +160,8 @@ impl AgentRebuildSpec {
         self: &Arc<Self>,
         definition: AgentDefinition,
     ) -> Result<Agent, AgentBuildError> {
-        self.build_agent_inner(definition, None, None).await
+        let (agent, _build_elapsed) = self.build_agent_inner(definition, None, None).await?;
+        Ok(agent)
     }
     /// Build an agent with optional one-shot overrides for initial spawn.
     ///
@@ -168,12 +174,16 @@ impl AgentRebuildSpec {
     ///
     /// Both are consumed once — the rebuild path (`build_agent`) passes
     /// `None` for both so zero-turn model switches get fresh discovery.
+    /// Returns the built agent and the pure construction time (entry to
+    /// `SB_BUILDER_DONE`, before the batched resource seed), so the caller can
+    /// attribute `AgentBuild` and `ToolSetup` phases to the same boundaries the
+    /// waterfall marks use.
     pub(crate) async fn build_agent_with_initial_overrides(
         self: &Arc<Self>,
         definition: AgentDefinition,
         persisted_skill_names: Option<std::collections::HashSet<String>>,
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
-    ) -> Result<Agent, AgentBuildError> {
+    ) -> Result<(Agent, std::time::Duration), AgentBuildError> {
         self.build_agent_inner(definition, persisted_skill_names, preloaded_skills)
             .await
     }
@@ -183,7 +193,8 @@ impl AgentRebuildSpec {
         definition: AgentDefinition,
         persisted_skill_names: Option<std::collections::HashSet<String>>,
         preloaded_skills: Option<Vec<xai_grok_tools::implementations::skills::types::SkillInfo>>,
-    ) -> Result<Agent, AgentBuildError> {
+    ) -> Result<(Agent, std::time::Duration), AgentBuildError> {
+        let build_phase_start = std::time::Instant::now();
         let Self {
             working_directory,
             terminal_backend,
@@ -205,7 +216,9 @@ impl AgentRebuildSpec {
             image_gen_config,
             video_gen_config,
             app_builder_deployer_config,
+            media_gen_batch_limits: _,
             write_file_enabled,
+            active_agent_messages_enabled,
             subagents_enabled,
             subagent_toggle,
             background_workflows_enabled,
@@ -224,6 +237,7 @@ impl AgentRebuildSpec {
             attribution_callback,
             tool_params_json,
             subagent_event_tx,
+            subagent_coordinator_sender,
             monitor_event_buffer,
             user_question_tx,
             subagent_depth,
@@ -277,6 +291,7 @@ impl AgentRebuildSpec {
         .with_app_builder_deployer_config(app_builder_deployer_config.clone())
         .with_web_fetch_config(web_fetch_config.clone())
         .with_write_file_enabled(*write_file_enabled)
+        .with_active_agent_messages_enabled(*active_agent_messages_enabled)
         .with_fs(fs_backend.clone())
         .with_subagents_enabled(*subagents_enabled)
         .with_subagent_toggle(subagent_toggle.clone())
@@ -336,80 +351,87 @@ impl AgentRebuildSpec {
             builder = builder.with_preloaded_skills(skills);
         }
         let agent = builder.build().await?;
+        crate::waterfall::mark(session_id_str, crate::waterfall::stage::SB_BUILDER_DONE);
+        let agent_build_elapsed = build_phase_start.elapsed();
         let model_validator = models_manager.clone();
         agent
             .tool_bridge()
-            .update_resource(TaskModelValidator::new(move |requested| {
-                model_validator.task_model_error(requested)
-            }))
+            .update_resources_with(|resources| {
+                resources
+                    .insert(
+                        TaskModelValidator::new(move |requested| {
+                            model_validator.task_model_error(requested)
+                        }),
+                    );
+                if let Some(event_tx) = subagent_event_tx.clone() {
+                    use xai_grok_tools::implementations::grok_build::task::backend::{
+                        ChannelBackend, SubagentBackendResource,
+                    };
+                    use xai_grok_tools::implementations::grok_build::task::types::{
+                        MaxSubagentDepth, SessionIdResource, SubagentDepthCounter,
+                        SubagentEventSender,
+                    };
+                    resources
+                        .insert(
+                            SubagentBackendResource(
+                                Arc::new(
+                                    subagent_coordinator_sender
+                                        .as_ref()
+                                        .map_or_else(
+                                            || ChannelBackend::for_session(
+                                                event_tx.clone(),
+                                                session_id_str.clone(),
+                                            ),
+                                            |sender| ChannelBackend::for_coordinator_session(
+                                                sender.clone(),
+                                                session_id_str.clone(),
+                                            ),
+                                        ),
+                                ),
+                            ),
+                        );
+                    resources.insert(SubagentDepthCounter(*subagent_depth));
+                    resources.insert(MaxSubagentDepth(*subagents_max_depth));
+                    resources.insert(SessionIdResource(session_id_str.clone()));
+                    resources.insert(SubagentEventSender(event_tx));
+                    resources
+                        .insert(
+                            crate::tools::tool_context::subagent_foreground_wait(
+                                Arc::clone(blocking_wait_depth),
+                            ),
+                        );
+                    if let Some(buffer) = monitor_event_buffer.clone() {
+                        resources.insert(buffer);
+                    }
+                }
+                resources
+                    .insert(
+                        xai_grok_tools::types::resources::RespectGitignore(
+                            *respect_gitignore,
+                        ),
+                    );
+                resources
+                    .insert(
+                        xai_grok_tools::types::resources::SchedulerBackgroundLoops(
+                            *scheduler_background_loops,
+                        ),
+                    );
+                resources
+                    .insert(
+                        xai_grok_tools::types::resources::PathNotFoundHints(
+                            *path_not_found_hints,
+                        ),
+                    );
+                if let Some(client) = managed_gateway_tool_client.clone() {
+                    resources.insert(client);
+                }
+                {
+                    use xai_grok_tools::implementations::grok_build::ask_user_question::UserQuestionSender;
+                    resources.insert(UserQuestionSender(user_question_tx.clone()));
+                }
+            })
             .await;
-        if let Some(event_tx) = subagent_event_tx.clone() {
-            use xai_grok_tools::implementations::grok_build::task::backend::{
-                ChannelBackend, SubagentBackendResource,
-            };
-            use xai_grok_tools::implementations::grok_build::task::types::{
-                MaxSubagentDepth, SessionIdResource, SubagentDepthCounter, SubagentEventSender,
-            };
-            let backend = SubagentBackendResource(Arc::new(ChannelBackend::for_session(
-                event_tx.clone(),
-                session_id_str.clone(),
-            )));
-            agent.tool_bridge().update_resource(backend).await;
-            agent
-                .tool_bridge()
-                .update_resource(SubagentDepthCounter(*subagent_depth))
-                .await;
-            agent
-                .tool_bridge()
-                .update_resource(MaxSubagentDepth(*subagents_max_depth))
-                .await;
-            agent
-                .tool_bridge()
-                .update_resource(SessionIdResource(session_id_str.clone()))
-                .await;
-            agent
-                .tool_bridge()
-                .update_resource(SubagentEventSender(event_tx))
-                .await;
-            agent
-                .tool_bridge()
-                .update_resource(crate::tools::tool_context::subagent_foreground_wait(
-                    Arc::clone(blocking_wait_depth),
-                ))
-                .await;
-            if let Some(buffer) = monitor_event_buffer.clone() {
-                agent.tool_bridge().update_resource(buffer).await;
-            }
-        }
-        agent
-            .tool_bridge()
-            .update_resource(xai_grok_tools::types::resources::RespectGitignore(
-                *respect_gitignore,
-            ))
-            .await;
-        agent
-            .tool_bridge()
-            .update_resource(xai_grok_tools::types::resources::SchedulerBackgroundLoops(
-                *scheduler_background_loops,
-            ))
-            .await;
-        agent
-            .tool_bridge()
-            .update_resource(xai_grok_tools::types::resources::PathNotFoundHints(
-                *path_not_found_hints,
-            ))
-            .await;
-        if let Some(client) = managed_gateway_tool_client.clone() {
-            agent.tool_bridge().update_resource(client).await;
-        }
-        {
-            use xai_grok_tools::implementations::grok_build::ask_user_question::UserQuestionSender;
-            agent
-                .tool_bridge()
-                .update_resource(UserQuestionSender(user_question_tx.clone()))
-                .await;
-        }
-        Ok(agent)
+        Ok((agent, agent_build_elapsed))
     }
 }
 /// Build a stub [`AgentRebuildSpec`] for unit tests.
@@ -444,7 +466,9 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         image_gen_config: ImageGenConfig::default(),
         video_gen_config: VideoGenConfig::default(),
         app_builder_deployer_config: AppBuilderDeployerConfig::default(),
+        media_gen_batch_limits: xai_grok_tools::media_gen_limits::MediaGenBatchLimits::default(),
         write_file_enabled: true,
+        active_agent_messages_enabled: false,
         subagents_enabled: false,
         subagent_toggle: HashMap::new(),
         background_workflows_enabled: false,
@@ -463,6 +487,7 @@ pub(crate) fn test_rebuild_spec_default() -> Arc<AgentRebuildSpec> {
         attribution_callback: None,
         tool_params_json: ResolvedToolParamsJson::default(),
         subagent_event_tx: None,
+        subagent_coordinator_sender: None,
         monitor_event_buffer: None,
         user_question_tx: uq_tx,
         subagent_depth: 0,

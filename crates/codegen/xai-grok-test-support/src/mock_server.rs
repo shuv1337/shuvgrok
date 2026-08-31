@@ -44,6 +44,8 @@ pub struct LogEntry {
     pub authorization: Option<String>,
     /// Lowercase names in arrival order. Empty for the GET endpoints.
     pub headers: Vec<(String, String)>,
+    /// Wall-clock arrival time, for latency-harness request timelines.
+    pub at: std::time::SystemTime,
 }
 
 impl LogEntry {
@@ -97,6 +99,7 @@ impl RequestLog {
             body: body.cloned(),
             authorization: authorization.map(String::from),
             headers,
+            at: std::time::SystemTime::now(),
         });
     }
 }
@@ -242,6 +245,14 @@ struct StorageState {
     uploads: std::sync::Mutex<Vec<StorageUpload>>,
 }
 
+#[derive(Clone, Copy, Default)]
+enum StartupFetchStall {
+    #[default]
+    None,
+    Delay(Duration),
+    Hang,
+}
+
 pub struct MockInferenceServer {
     addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
@@ -256,8 +267,8 @@ pub struct MockInferenceServer {
     messages_stop_reason: Arc<std::sync::RwLock<String>>,
     chunk_delay: Arc<std::sync::RwLock<Option<Duration>>>,
     storage: Arc<StorageState>,
-    /// When set, `/v1/models` and `/v1/settings` never respond.
-    hang: Arc<std::sync::atomic::AtomicBool>,
+    startup_fetch_stall: Arc<std::sync::RwLock<StartupFetchStall>>,
+    startup_stalls_served: Arc<std::sync::atomic::AtomicU32>,
     user_tier: Arc<std::sync::RwLock<Option<String>>>,
 }
 
@@ -294,7 +305,8 @@ impl MockInferenceServer {
         let messages_stop_reason = Arc::new(std::sync::RwLock::new("end_turn".to_string()));
         let chunk_delay = Arc::new(std::sync::RwLock::new(None::<Duration>));
         let storage = Arc::new(StorageState::default());
-        let hang = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let startup_fetch_stall = Arc::new(std::sync::RwLock::new(StartupFetchStall::None));
+        let startup_stalls_served = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let user_tier = Arc::new(std::sync::RwLock::new(None::<String>));
         let app = Self::build_router(
             log.clone(),
@@ -306,7 +318,8 @@ impl MockInferenceServer {
             messages_stop_reason.clone(),
             chunk_delay.clone(),
             storage.clone(),
-            hang.clone(),
+            startup_fetch_stall.clone(),
+            startup_stalls_served.clone(),
             user_tier.clone(),
         );
 
@@ -346,7 +359,8 @@ impl MockInferenceServer {
             messages_stop_reason,
             chunk_delay,
             storage,
-            hang,
+            startup_fetch_stall,
+            startup_stalls_served,
             user_tier,
         })
     }
@@ -365,6 +379,13 @@ impl MockInferenceServer {
     /// falls back to the response mode.
     pub fn enqueue_response(&self, path: impl Into<String>, response: ScriptedResponse) {
         self.overrides.enqueue_response(path, response);
+    }
+
+    /// Default-responder concurrency cap: over `cap` in-flight (each held for
+    /// `hold`), extra requests get 429 + `Retry-After`. Scripts/expectations bypass.
+    pub fn set_inference_concurrency_cap(&self, cap: usize, hold: Duration, retry_after_secs: u64) {
+        self.overrides
+            .set_concurrency_cap(cap, hold, retry_after_secs);
     }
 
     /// Register one named response matched atomically by endpoint and request kind.
@@ -411,7 +432,24 @@ impl MockInferenceServer {
 
     /// Stand in for a black-holed backend.
     pub fn set_hang(&self, hang: bool) {
-        self.hang.store(hang, std::sync::atomic::Ordering::Release);
+        *self.startup_fetch_stall.write().unwrap() = if hang {
+            StartupFetchStall::Hang
+        } else {
+            StartupFetchStall::None
+        };
+    }
+
+    pub fn set_startup_fetch_delay(&self, delay: Duration) {
+        *self.startup_fetch_stall.write().unwrap() = StartupFetchStall::Delay(delay);
+    }
+
+    pub fn clear_startup_fetch_stall(&self) {
+        *self.startup_fetch_stall.write().unwrap() = StartupFetchStall::None;
+    }
+
+    pub fn startup_stalls_served(&self) -> u32 {
+        self.startup_stalls_served
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The `subscriptionTier` on `GET /v1/user`. `None`, the default, omits the
@@ -641,6 +679,14 @@ impl MockInferenceServer {
         agent_turns.lock().unwrap().pop_front()
     }
 
+    async fn apply_startup_fetch_stall(stall: StartupFetchStall) {
+        match stall {
+            StartupFetchStall::None => {}
+            StartupFetchStall::Delay(delay) => tokio::time::sleep(delay).await,
+            StartupFetchStall::Hang => std::future::pending().await,
+        }
+    }
+
     fn build_router(
         log: Arc<RequestLog>,
         models: Arc<std::sync::RwLock<Vec<Value>>>,
@@ -651,11 +697,14 @@ impl MockInferenceServer {
         messages_stop_reason: Arc<std::sync::RwLock<String>>,
         chunk_delay: Arc<std::sync::RwLock<Option<Duration>>>,
         storage: Arc<StorageState>,
-        hang: Arc<std::sync::atomic::AtomicBool>,
+        startup_fetch_stall: Arc<std::sync::RwLock<StartupFetchStall>>,
+        startup_stalls_served: Arc<std::sync::atomic::AtomicU32>,
         user_tier: Arc<std::sync::RwLock<Option<String>>>,
     ) -> Router {
-        let hang_models = hang.clone();
-        let hang_settings = hang;
+        let stall_models = startup_fetch_stall.clone();
+        let stall_settings = startup_fetch_stall;
+        let served_models = startup_stalls_served.clone();
+        let served_settings = startup_stalls_served;
         let log_cc = log.clone();
         let log_rs = log.clone();
         let log_msg = log.clone();
@@ -915,11 +964,14 @@ impl MockInferenceServer {
                     move || {
                         let log = log.clone();
                         let models = models.clone();
-                        let hang = hang_models.clone();
+                        let stall = stall_models.clone();
+                        let served = served_models.clone();
                         async move {
                             log.record("GET", "/v1/models", None, None, Vec::new());
-                            if hang.load(std::sync::atomic::Ordering::Acquire) {
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
+                            let stall = *stall.read().unwrap();
+                            Self::apply_startup_fetch_stall(stall).await;
+                            if !matches!(stall, StartupFetchStall::None) {
+                                served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             let models_json = models.read().unwrap().clone();
                             Json(json!({
@@ -935,16 +987,19 @@ impl MockInferenceServer {
                 get({
                     let log = log.clone();
                     let settings = settings.clone();
-                    let hang = hang_settings.clone();
+                    let stall_settings = stall_settings.clone();
                     move || {
                         let log = log.clone();
                         let settings = settings.clone();
                         let overrides = overrides_settings.clone();
-                        let hang = hang.clone();
+                        let stall = stall_settings.clone();
+                        let served = served_settings.clone();
                         async move {
                             log.record("GET", "/v1/settings", None, None, Vec::new());
-                            if hang.load(std::sync::atomic::Ordering::Acquire) {
-                                tokio::time::sleep(Duration::from_secs(3600)).await;
+                            let stall = *stall.read().unwrap();
+                            Self::apply_startup_fetch_stall(stall).await;
+                            if !matches!(stall, StartupFetchStall::None) {
+                                served.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             }
                             // Scripts take precedence, so a test can serve a
                             // transient payload before the steady-state value.
@@ -1112,6 +1167,7 @@ impl Drop for MockInferenceServer {
     }
 }
 
+#[allow(clippy::disallowed_methods)] // test clients hit localhost mocks
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1773,6 +1829,48 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body, json!({ "allow_access": true }));
+    }
+
+    #[tokio::test]
+    async fn startup_fetch_delay_slows_models_and_settings_then_clears() {
+        let server = MockInferenceServer::start().await.unwrap();
+        let models_url = format!("{}/models", server.url());
+        let settings_url = format!("{}/settings", server.url());
+
+        let delay = Duration::from_millis(600);
+        server.set_startup_fetch_delay(delay);
+
+        for url in [&models_url, &settings_url] {
+            let started = std::time::Instant::now();
+            let resp = reqwest::get(url).await.unwrap();
+            assert!(resp.status().is_success() || resp.status() == 404, "{url}");
+            assert!(
+                started.elapsed() >= delay,
+                "{url} returned in {:?}, faster than the injected {delay:?}",
+                started.elapsed(),
+            );
+        }
+
+        server.set_hang(true);
+        server.set_startup_fetch_delay(delay);
+        let started = std::time::Instant::now();
+        tokio::time::timeout(delay * 4, reqwest::get(&models_url))
+            .await
+            .expect("the delay must replace the hang")
+            .unwrap();
+        assert!(
+            started.elapsed() >= delay,
+            "the delay must replace the hang"
+        );
+
+        server.clear_startup_fetch_stall();
+        let started = std::time::Instant::now();
+        reqwest::get(&models_url).await.unwrap();
+        assert!(
+            started.elapsed() < delay,
+            "clearing the delay should make /v1/models fast again, took {:?}",
+            started.elapsed(),
+        );
     }
 
     #[tokio::test]

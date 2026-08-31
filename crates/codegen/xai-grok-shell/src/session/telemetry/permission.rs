@@ -2,7 +2,7 @@ use xai_grok_telemetry::enums::PermissionMode;
 use xai_grok_telemetry::events::{
     self, PermissionClassifierSource, PermissionClassifierVerdict, PermissionDecisionPayload,
     PermissionDecisionReason, PermissionOutcome, PermissionPromptOutcome,
-    PermissionSecurityFinding,
+    PermissionPromptOutcomeDetail, PermissionSecurityFinding,
 };
 use xai_grok_workspace::permission::{
     AUTO_DENY_CONSECUTIVE_LIMIT, AUTO_DENY_TOTAL_LIMIT, Decision, PermissionEvent,
@@ -16,6 +16,8 @@ use xai_grok_workspace::permission::{
 pub(crate) struct ManagerPermissionAnalytics {
     pub manager_prompt_attempted: Option<bool>,
     pub prompt_outcome: Option<PermissionPromptOutcome>,
+    pub prompt_outcome_detail: Option<PermissionPromptOutcomeDetail>,
+    pub remember_tool_approvals: Option<bool>,
     pub decision_reason: Option<PermissionDecisionReason>,
     pub classifier_source: Option<PermissionClassifierSource>,
     pub classifier_verdict: Option<PermissionClassifierVerdict>,
@@ -81,6 +83,11 @@ pub(crate) fn manager_permission_analytics(
             .prompt_outcome
             .as_deref()
             .and_then(|s| try_enum("prompt_outcome", s)),
+        prompt_outcome_detail: ev
+            .prompt_outcome
+            .as_deref()
+            .and_then(|s| try_enum("prompt_outcome_detail", s)),
+        remember_tool_approvals: ev.remember_tool_approvals,
         decision_reason: ev
             .decision_reason
             .as_deref()
@@ -201,6 +208,12 @@ pub(crate) fn permission_outcome(decision: &Decision) -> PermissionOutcome {
 /// `tool.decision` span), so mode/wait/source are never re-derived — the span and
 /// product rails cannot observe different shell state. Content-free analytics
 /// come from [`manager_permission_analytics`].
+pub(crate) fn canonical_permission_tool_name(
+    access: &xai_grok_workspace::permission::AccessKind,
+) -> String {
+    xai_grok_workspace::permission::prompter_tool_name_for_access(access)
+}
+
 pub(crate) fn permission_decision_payload(
     tool_name: String,
     access_kind: events::AccessKind,
@@ -221,6 +234,8 @@ pub(crate) fn permission_decision_payload(
         subagent_type: None,
         manager_prompt_attempted: analytics.manager_prompt_attempted,
         prompt_outcome: analytics.prompt_outcome,
+        prompt_outcome_detail: analytics.prompt_outcome_detail,
+        remember_tool_approvals: analytics.remember_tool_approvals,
         decision_reason: analytics.decision_reason,
         classifier_source: analytics.classifier_source,
         classifier_verdict: analytics.classifier_verdict,
@@ -274,6 +289,7 @@ mod permission_analytics_tests {
             queue_depth: Some(1),
             security_findings: Some(vec!["opaque_shell".into()]),
             classifier_verdict: Some(classifier_verdict.into()),
+            remember_tool_approvals: Some(true),
         }
     }
 
@@ -307,10 +323,114 @@ mod permission_analytics_tests {
     }
 
     #[test]
+    fn renamed_agent_message_keeps_canonical_product_and_external_identity() {
+        let access = xai_grok_workspace::permission::AccessKind::AgentMessage {
+            subagent_id: "sub-1".into(),
+        };
+        let canonical = canonical_permission_tool_name(&access);
+        assert_eq!(canonical, "send_subagent_message");
+        assert_ne!(canonical, "relay_to_subagent");
+
+        let event = PermissionEvent {
+            tool_id: "tc-message".into(),
+            tool_name: canonical.clone(),
+            access_kind: "agent_message".into(),
+            access_detail: Some("sub-1".into()),
+            yolo_mode: false,
+            auto_approved: false,
+            user_prompted: true,
+            decision: "allow".into(),
+            prompt_outcome: Some("allow_once".into()),
+            reject_reason: None,
+            timestamp: Utc::now(),
+            subagent_session_id: None,
+            subagent_type: None,
+            subagent_description: None,
+            permission_mode: Some("ask".into()),
+            decision_reason: Some("needs_user".into()),
+            classifier_source: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+            wait_ms: Some(1),
+            queue_depth: Some(1),
+            security_findings: None,
+            classifier_verdict: None,
+            remember_tool_approvals: Some(true),
+        };
+        let decision = Decision::Allow;
+        let resolved =
+            resolved_decision_telemetry(Some(&event), &decision, PermissionMode::Ask, 0, false);
+        let payload = permission_decision_payload(
+            canonical,
+            events::AccessKind::AgentMessage,
+            &decision,
+            None,
+            Some(&event),
+            resolved,
+        );
+        assert_eq!(payload.tool_name, "send_subagent_message");
+        assert_eq!(
+            serde_json::to_value(payload.access_kind).unwrap(),
+            serde_json::json!("agent_message")
+        );
+    }
+
+    #[test]
+    fn agent_message_payload_keeps_dedicated_identity() {
+        let event = PermissionEvent {
+            tool_id: "tc-message".into(),
+            tool_name: "send_subagent_message".into(),
+            access_kind: "agent_message".into(),
+            access_detail: Some("sub-1".into()),
+            yolo_mode: false,
+            auto_approved: false,
+            user_prompted: true,
+            decision: "allow".into(),
+            prompt_outcome: Some("allow_once".into()),
+            reject_reason: None,
+            timestamp: Utc::now(),
+            subagent_session_id: None,
+            subagent_type: None,
+            subagent_description: None,
+            permission_mode: Some("ask".into()),
+            decision_reason: Some("needs_user".into()),
+            classifier_source: None,
+            classifier_latency_ms: None,
+            auto_denials_consecutive: None,
+            auto_denials_total: None,
+            wait_ms: Some(1),
+            queue_depth: Some(1),
+            security_findings: None,
+            classifier_verdict: None,
+            remember_tool_approvals: Some(true),
+        };
+        let decision = Decision::Allow;
+        let resolved =
+            resolved_decision_telemetry(Some(&event), &decision, PermissionMode::Ask, 0, false);
+        let payload = permission_decision_payload(
+            event.tool_name.clone(),
+            events::AccessKind::AgentMessage,
+            &decision,
+            None,
+            Some(&event),
+            resolved,
+        );
+
+        assert_eq!(payload.tool_name, "send_subagent_message");
+        assert_eq!(
+            serde_json::to_value(payload.access_kind).unwrap(),
+            serde_json::json!("agent_message")
+        );
+    }
+
+    #[test]
     fn event_less_projection_omits_all_manager_fields() {
         let a = manager_permission_analytics(None);
         assert!(a.manager_prompt_attempted.is_none());
         assert!(a.prompt_outcome.is_none());
+        assert!(a.prompt_outcome_detail.is_none());
+        assert!(a.remember_tool_approvals.is_none());
         assert!(a.decision_reason.is_none());
         assert!(a.classifier_source.is_none());
         assert!(a.classifier_verdict.is_none());
@@ -474,6 +594,35 @@ mod permission_analytics_tests {
                 "manager prompt outcome {wire} is not mapped by PermissionPromptOutcome"
             );
         }
+    }
+
+    /// Drift guard: the outcome-detail enum is a bijection with the manager's
+    /// `PromptOutcomeKind::ALL` wire vocabulary, so a new "Always allow"
+    /// surface cannot be silently dropped from adoption analytics.
+    #[test]
+    fn prompt_outcome_detail_matches_manager_vocabulary() {
+        use std::collections::BTreeSet;
+        use xai_grok_telemetry::events::PermissionPromptOutcomeDetail;
+        use xai_grok_workspace::permission::PromptOutcomeKind;
+        let manager: BTreeSet<&str> = PromptOutcomeKind::ALL
+            .iter()
+            .map(|k| k.wire_str())
+            .collect();
+        let enum_wire: BTreeSet<String> = PermissionPromptOutcomeDetail::ALL
+            .iter()
+            .map(|d| {
+                serde_json::to_value(d)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let enum_refs: BTreeSet<&str> = enum_wire.iter().map(String::as_str).collect();
+        assert_eq!(
+            manager, enum_refs,
+            "manager prompt-outcome wires and PermissionPromptOutcomeDetail must be identical sets"
+        );
     }
 
     /// Drift guard: the classifier-source enum is a bijection with the workspace

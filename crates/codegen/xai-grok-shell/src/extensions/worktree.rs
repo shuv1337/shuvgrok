@@ -146,6 +146,7 @@ fn log_effective_worktree_type(
         "WORKTREE_REQUEST_SHELL: resolved effective worktree type"
     );
 }
+#[tracing::instrument(name = "ext.worktree", skip_all, fields(method = %args.method))]
 pub async fn handle(
     agent: &MvpAgent,
     ops: &xai_grok_workspace::WorkspaceOps,
@@ -162,6 +163,7 @@ pub async fn handle(
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create",
                 request_worktree_type,
@@ -212,6 +214,7 @@ pub async fn handle(
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create_from_worktree",
                 request_worktree_type,
@@ -292,6 +295,7 @@ pub async fn handle(
             if req.worktree_type.is_none() {
                 req.worktree_type = Some(worktree_type_default.into());
             }
+            apply_grove_worktree_flag(agent, &mut req.grove_worktree);
             log_effective_worktree_type(
                 "x.ai/git/worktree/create_from_worktree_sync",
                 request_worktree_type,
@@ -318,6 +322,8 @@ pub async fn handle(
                 worktree_type_default,
                 req.worktree_type.unwrap_or(worktree_type_default.into()),
             );
+            let mut grove_worktree = None;
+            apply_grove_worktree_flag(agent, &mut grove_worktree);
             let registry_client = agent.session_registry_client();
             let agent_id = xai_grok_telemetry::id::agent_id();
 
@@ -330,6 +336,7 @@ pub async fn handle(
                     registry_client.as_ref(),
                     Some(agent.auth_manager.clone()),
                     &agent_id,
+                    grove_worktree,
                 )
                 .await,
             )
@@ -431,8 +438,90 @@ pub async fn handle(
                 .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
             to_response(Ok(result))
         }
+        "x.ai/git/worktree/detach" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct DetachReq {
+                id_or_path: String,
+                #[serde(default)]
+                allow_copy: bool,
+            }
+            let req = serde_json::from_str::<DetachReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeDetachReq {
+                        id_or_path: req.id_or_path,
+                        allow_copy: req.allow_copy,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
+        "x.ai/git/worktree/salvage" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct SalvageReq {
+                id_or_path: String,
+                out: String,
+            }
+            let req = serde_json::from_str::<SalvageReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeSalvageReq {
+                        id_or_path: req.id_or_path,
+                        out: req.out,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
+        "x.ai/git/worktree/clean-artifacts" => {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct CleanReq {
+                id_or_path: String,
+            }
+            let req = serde_json::from_str::<CleanReq>(args.params.get())?;
+            let result = ops
+                .dispatch(
+                    &xai_grok_workspace::workspace_ops::WorktreeCleanArtifactsReq {
+                        id_or_path: req.id_or_path,
+                    },
+                    None,
+                )
+                .await
+                .map_err(|e| acp::Error::internal_error().data(e.to_string()))?;
+            to_response(Ok(result))
+        }
         _ => Err(acp::Error::method_not_found()),
     }
+}
+
+fn apply_grove_worktree_flag(agent: &MvpAgent, slot: &mut Option<bool>) {
+    let root = crate::config::load_effective_config()
+        .unwrap_or_else(|_| toml::Value::Table(toml::map::Map::new()));
+    let cfg = agent.cfg.borrow();
+    apply_grove_worktree_gate(slot, &root, cfg.remote_settings.as_ref());
+}
+
+/// Always run the grove gate, even when `slot` is already `Some`. Kill switch last.
+pub(crate) fn apply_grove_worktree_gate(
+    slot: &mut Option<bool>,
+    root: &toml::Value,
+    remote: Option<&crate::util::config::RemoteSettings>,
+) {
+    let (enabled, src) = crate::util::config::gate_grove_worktree(*slot, root, remote);
+    tracing::info!(
+        target: WORKTREE_EXT_LOG,
+        grove_worktree = enabled,
+        source = src,
+        "WORKTREE_REQUEST_SHELL: resolved grove materialize strategy"
+    );
+    *slot = Some(enabled);
 }
 
 #[cfg(test)]
@@ -478,6 +567,81 @@ mod tests {
         assert!(req.dry_run);
         assert_eq!(req.max_age.as_deref(), Some("7d"));
         assert!(req.force);
+    }
+
+    #[test]
+    fn apply_grove_worktree_gate_runs_when_slot_already_some() {
+        let root: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let remote = crate::util::config::RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+        let mut slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, Some(&remote));
+        assert_eq!(
+            slot,
+            Some(false),
+            "ACP wrapper must re-run the gate when the client already set Some(true)"
+        );
+        let mut slot = Some(true);
+        apply_grove_worktree_gate(&mut slot, &root, None);
+        assert_eq!(
+            slot,
+            Some(false),
+            "ACP wrapper must fail closed when remote settings are unavailable"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_grove_worktree_gate_resume_parity_with_create() {
+        use crate::util::config::ENV_WORKTREE_TYPE;
+
+        unsafe { std::env::remove_var(ENV_WORKTREE_TYPE) };
+        let local_grove: toml::Value = toml::from_str("[cli]\ngrove_worktree = true").unwrap();
+        let empty: toml::Value = toml::from_str("[cli]\nauto_update = true").unwrap();
+        let remote_unset = crate::util::config::RemoteSettings {
+            grove_worktree: None,
+            ..Default::default()
+        };
+        let remote_kill = crate::util::config::RemoteSettings {
+            grove_worktree: Some(false),
+            ..Default::default()
+        };
+
+        let mut slot = None;
+        apply_grove_worktree_gate(&mut slot, &local_grove, Some(&remote_unset));
+        assert_eq!(
+            slot,
+            Some(true),
+            "remote Some(unset) + local grove must enable, same as create"
+        );
+
+        unsafe { std::env::set_var(ENV_WORKTREE_TYPE, "grove") };
+        let mut slot = None;
+        apply_grove_worktree_gate(&mut slot, &empty, Some(&remote_unset));
+        assert_eq!(
+            slot,
+            Some(true),
+            "remote Some(unset) + env grove must enable, same as create"
+        );
+
+        let mut slot = None;
+        apply_grove_worktree_gate(&mut slot, &empty, Some(&remote_kill));
+        assert_eq!(
+            slot,
+            Some(false),
+            "remote kill must disable even when env asked for grove"
+        );
+
+        let mut slot = None;
+        apply_grove_worktree_gate(&mut slot, &empty, None);
+        unsafe { std::env::remove_var(ENV_WORKTREE_TYPE) };
+        assert_eq!(
+            slot,
+            Some(false),
+            "true unavailability (remote = None) must fail-close even if env asked for grove"
+        );
     }
 
     #[test]

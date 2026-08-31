@@ -23,8 +23,6 @@ pub use xai_grok_config_types::{
 };
 // Relay-sync + MCP-config value types extracted; re-exported to keep paths stable.
 pub use xai_grok_config_types::{McpConfig, RelaySyncConfig};
-// Worktree-pool config value type extracted; re-exported to keep paths stable.
-pub use xai_grok_config_types::PoolConfig;
 
 /// TUI/CLI settings. Composed from typed section configs defined in `agent::config`.
 #[derive(Debug, Clone, Default)]
@@ -51,6 +49,29 @@ pub struct Config {
     pub ask_user_question: crate::tools::config::AskUserQuestionToolConfig,
     /// `[privacy]` — local banner ack (not auth-metadata).
     pub privacy: PrivacyConfig,
+    pub consent: super::consent::ConsentConfig,
+    /// `[telemetry]` — only the key the pager persists round-trips.
+    pub telemetry: TelemetryPersistConfig,
+    /// `[features]` — only the key the pager persists round-trips.
+    pub features: FeaturesPersistConfig,
+}
+
+/// The `[telemetry]` slice the pager is allowed to write back. Unmodeled
+/// keys under `[telemetry]` are preserved by the deep merge in
+/// `save_config_locked`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct TelemetryPersistConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_upload: Option<bool>,
+}
+
+/// The `[features]` slice the pager is allowed to write back. Unmodeled
+/// keys under `[features]` are preserved by the deep merge in
+/// `save_config_locked`.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct FeaturesPersistConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_trace_card: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -121,8 +142,15 @@ pub(crate) fn load_mcp_servers_with_oauth(
     cwd: &std::path::Path,
     compat: &CompatConfig,
 ) -> (Vec<acp::McpServer>, McpOAuthConfigMap) {
-    let global_config =
-        crate::config::load_from_disk().unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
+    // Read the same effective config that `load_mcp_servers` /
+    // `reload_mcp_servers_merged` start servers from, so the server list and its
+    // parallel OAuth map derive from one snapshot. This aligns the OAuth map
+    // with the effective-config server list, so a managed- or
+    // requirements-defined server cannot start without its OAuth client
+    // settings. (The overlay is stripped of `mcp_servers`, so it never
+    // contributes a server here.)
+    let global_config = crate::config::load_effective_config()
+        .unwrap_or_else(|_| TomlValue::Table(toml::map::Map::new()));
 
     let mut servers_map: IndexMap<String, McpServerConfig> = IndexMap::new();
     for (name, config) in parse_mcp_servers_from_toml(&global_config) {
@@ -176,22 +204,6 @@ pub(crate) fn load_mcp_servers_with_oauth(
     }
 
     (acp_servers, oauth_configs)
-}
-
-/// Load the worktree pool configuration from config.toml.
-/// Returns the default config if the section is missing.
-pub fn worktree_pool_from_toml(root: &TomlValue) -> PoolConfig {
-    if let TomlValue::Table(table) = root
-        && let Some(pool_val) = table.get("worktree_pool")
-    {
-        // Try to deserialize the section; fall back to defaults on error
-        pool_val
-            .clone()
-            .try_into::<PoolConfig>()
-            .unwrap_or_default()
-    } else {
-        PoolConfig::default()
-    }
 }
 
 /// Load MCP servers with project-scoped overrides from `.grok/config.toml`.
@@ -774,35 +786,22 @@ async fn write_toml_table_if_changed(
             return Err(anyhow::anyhow!("failed to read {}: {e}", path.display()));
         }
     };
-    let mut root: TomlValue = if original.is_empty() {
-        TomlValue::Table(TomlMap::new())
-    } else {
-        match toml::from_str(&original) {
-            Ok(v) => v,
-            Err(parse_err) => {
-                return Err(anyhow::anyhow!(
-                    "refusing to overwrite unparseable {}: {}; fix the syntax before retrying",
-                    path.display(),
-                    parse_err
-                ));
-            }
+    let mut root = match super::persist::parse_existing_config_toml(&original) {
+        Ok(v) => v,
+        Err(parse_err) => {
+            return Err(anyhow::anyhow!(
+                "refusing to overwrite unparseable {}: {}; fix the syntax before retrying",
+                path.display(),
+                parse_err
+            ));
         }
     };
+    let before = toml::to_string_pretty(&root)?;
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow::anyhow!("config root is not a table"))?;
     f(table);
     let toml_str = toml::to_string_pretty(&root)?;
-    // Normalize empty original so first enable/disable still writes when needed.
-    let before = if original.is_empty() {
-        toml::to_string_pretty(&TomlValue::Table(TomlMap::new()))?
-    } else {
-        // Re-serialize original for stable comparison (ignore formatting noise).
-        match toml::from_str::<TomlValue>(&original) {
-            Ok(v) => toml::to_string_pretty(&v).unwrap_or(original),
-            Err(_) => original,
-        }
-    };
     if before == toml_str {
         return Ok(false);
     }
@@ -1352,7 +1351,7 @@ pub(crate) fn load_claude_json_mcp_servers(
         return vec![];
     }
 
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = xai_dirs::home_dir() else {
         return vec![];
     };
     let claude_json_path = home.join(".claude.json");
@@ -1367,7 +1366,7 @@ pub(crate) fn load_claude_json_mcp_servers(
 pub(crate) fn load_claude_json_mcp_servers_for_attribution(
     cwd: &std::path::Path,
 ) -> Vec<acp::McpServer> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = xai_dirs::home_dir() else {
         return vec![];
     };
     load_claude_json_mcp_servers_from(&home.join(".claude.json"), cwd)
@@ -1398,7 +1397,7 @@ pub(crate) fn load_claude_json_mcp_servers_as_configs(
 pub(crate) fn load_claude_json_mcp_servers_as_configs_unfiltered(
     cwd: &std::path::Path,
 ) -> IndexMap<String, McpServerConfig> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = xai_dirs::home_dir() else {
         return IndexMap::new();
     };
     let claude_json_path = home.join(".claude.json");
@@ -1493,7 +1492,7 @@ pub(crate) fn load_cursor_mcp_servers(
     }
 
     // Global (lower priority)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = xai_dirs::home_dir() {
         let global_path = home.join(".cursor").join("mcp.json");
         for server in load_mcp_json_file(&global_path) {
             let name = match &server {
@@ -1536,7 +1535,7 @@ pub(crate) fn load_cursor_mcp_servers_as_configs(
     }
 
     // Global (lower priority — or_insert so project wins)
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = xai_dirs::home_dir() {
         let global_path = home.join(".cursor").join("mcp.json");
         if global_path.is_file()
             && let Some(config) = read_mcp_json(&global_path)
@@ -1756,16 +1755,19 @@ pub fn cli_known_mcp_server_names(cwd: &std::path::Path) -> std::collections::Ha
 }
 
 /// Plugin registry for one-shot CLI discovery (matches mcp doctor gating).
-fn load_cli_plugin_registry(cwd: &std::path::Path) -> xai_grok_agent::plugins::PluginRegistry {
+///
+/// Resolves the same cwd-effective `[plugins]` table as session startup
+/// (`resolve_effective_plugins_config`), so trusted project `[plugins].paths`
+/// plugins are included, not just the global config. Also used by the pager's
+/// `/agents` modal to list plugin-provided agents without a live session
+/// registry snapshot.
+pub fn load_cli_plugin_registry(cwd: &std::path::Path) -> xai_grok_agent::plugins::PluginRegistry {
     let trust_store = xai_grok_agent::plugins::TrustStore::load();
-    let mut plugins_cfg: crate::agent::config::PluginsConfig =
-        crate::config::load_effective_config()
-            .ok()
-            .and_then(|t| t.get("plugins").and_then(|v| v.clone().try_into().ok()))
-            .unwrap_or_default();
-    plugins_cfg.merge_claude_enabled_plugins(Some(cwd));
-    let mut plugin_config = plugins_cfg.to_discovery_config();
+    // Resolve/record the folder-trust verdict first: the effective-plugins
+    // resolve below gates project [plugins].paths on the cached verdict.
     let project_trusted = crate::agent::folder_trust::resolve_and_record(cwd, None, false);
+    let plugins_cfg = crate::config::resolve_effective_plugins_config(cwd);
+    let mut plugin_config = plugins_cfg.to_discovery_config();
     let discovered = xai_grok_agent::plugins::discover_plugins(
         Some(cwd),
         &plugin_config,
@@ -1942,6 +1944,56 @@ mod tests {
             let _g = xai_grok_test_support::EnvGuard::unset(SESSION_REGISTRY_ENV_VAR);
             assert_eq!(session_registry_local_override_sourced(None), None);
         }
+    }
+
+    /// A trusted project's `[plugins].paths` plugin (session-startup config
+    /// source) must be discovered by the one-shot CLI registry, including its
+    /// agents. Dev builds are folder-trust-inert, so the project path merges.
+    #[test]
+    #[serial_test::serial]
+    fn load_cli_plugin_registry_includes_project_config_path_plugins() {
+        let home = tempfile::tempdir().unwrap();
+        let _env = xai_grok_test_support::EnvGuard::set("GROK_HOME", home.path());
+
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+
+        // Project-declared [plugins].paths plugin providing one agent.
+        let plugin_dir = repo.path().join("proj-plugin");
+        let agents_dir = plugin_dir.join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name": "proj-plugin", "agents": "./agents"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("reviewer.md"),
+            "---\nname: reviewer\ndescription: Project reviewer\n---\nBody.\n",
+        )
+        .unwrap();
+
+        let grok = repo.path().join(".grok");
+        std::fs::create_dir_all(&grok).unwrap();
+        std::fs::write(
+            grok.join("config.toml"),
+            format!("[plugins]\npaths = [\"{}\"]\n", plugin_dir.display()),
+        )
+        .unwrap();
+
+        let registry = load_cli_plugin_registry(repo.path());
+        assert!(
+            registry.get("proj-plugin").is_some(),
+            "project [plugins].paths plugin must be discovered"
+        );
+        let agents = xai_grok_agent::discovery::plugin_agents(&registry);
+        assert!(
+            agents
+                .iter()
+                .any(|a| a.qualified_name == "proj-plugin:reviewer"),
+            "project config-path plugin agent must be enumerable, got: {:?}",
+            agents.iter().map(|a| &a.qualified_name).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2473,9 +2525,9 @@ expose_image_base64 = true
 
     #[test]
     fn load_cursor_mcp_servers_as_configs_parses_cursor_mcp_json() {
-        // NOTE: This test cannot override HOME (dirs::home_dir is not
-        // controlled by an env var on all platforms), so we test the
-        // underlying read_mcp_json + McpConfig round-trip instead.
+        // Overriding HOME/USERPROFILE mutates process-global env and races
+        // parallel tests, so this tests the underlying read_mcp_json +
+        // McpConfig round-trip instead of the home-anchored global path.
         let dir = tempfile::tempdir().unwrap();
         let mcp_json_path = dir.path().join("mcp.json");
         std::fs::write(
@@ -2573,7 +2625,7 @@ expose_image_base64 = true
             acp::McpServer::Http(acp::McpServerHttp { url, .. }) => {
                 assert_eq!(url, "https://fallback.example.com/mcp");
             }
-            other => panic!("expected Http, got {:?}", other),
+            _other => panic!("expected Http"),
         }
     }
 

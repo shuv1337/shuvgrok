@@ -38,6 +38,10 @@ pub struct AuthMeta {
     /// (e.g. "SuperGrok Heavy", "X Premium", "Free"). From CCP `/settings`.
     #[serde(default)]
     pub subscription_tier: Option<String>,
+    /// Whether `/feedback` may offer a one-shot trace upload; carried on auth
+    /// meta so it refreshes with auth changes.
+    #[serde(default)]
+    pub feedback_trace_offer: bool,
     /// Third-party subscription providers enabled in this build and whether
     /// each is signed in. Drives the `/usage` Subscriptions section. Empty
     /// when the alt-provider feature is off, so clients render nothing.
@@ -101,6 +105,7 @@ impl Default for AuthMeta {
             show_resolved_model: None,
             gate: None,
             subscription_tier: None,
+            feedback_trace_offer: false,
             subscription_providers: Vec::new(),
         }
     }

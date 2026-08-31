@@ -9,6 +9,7 @@ are preserved here.
 | Upstream | `xai-org/grok-build` |
 | Fork | `shuv1337/shuvgrok` |
 | Forked at | `eb267feff13129e568df38fb6fdf0ceb65f735d6` ("Synced from monorepo") |
+| Last synced | `bc7f02eddd3d` / `SOURCE_REV` `d5a0335a47221e8c9519936cb693e9b6450227ec` (2026-08-28) |
 | Product name | ShuvGrok |
 | Command | `shuvgrok` |
 | npm package | `@shuv1337/shuvgrok` |

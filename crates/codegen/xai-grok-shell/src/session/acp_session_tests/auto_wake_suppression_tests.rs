@@ -115,6 +115,7 @@ fn pending_notification_cap_keeps_newest_entries() {
         notifications_suppressed: true,
         rewindable: false,
         front_message_committed: false,
+        hook_block_hold: Default::default(),
         nudges_used_this_session: 0,
     };
     for index in 0..(MAX_PENDING_NOTIFICATIONS + 3) {
@@ -366,12 +367,9 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
     let local = tokio::task::LocalSet::new();
     local
         .run_until(async {
-            let (gateway_tx, _) = tokio::sync::mpsc::unbounded_channel::<
-                xai_acp_lib::AcpClientMessage,
-            >();
-            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<
-                PersistenceMsg,
-            >();
+            let (gateway_tx, _) =
+                tokio::sync::mpsc::unbounded_channel::<xai_acp_lib::AcpClientMessage>();
+            let (persistence_tx, _) = tokio::sync::mpsc::unbounded_channel::<PersistenceMsg>();
             let actor = std::sync::Arc::new(
                 create_test_actor(0, 256_000, 85, gateway_tx, persistence_tx).await,
             );
@@ -406,8 +404,12 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
             let state = actor.state.lock().await;
             assert_eq!(state.pending_inputs.len(), 1);
             assert!(matches!(
-                state.pending_inputs.front().map(|item| &item.origin),
-                Some(crate::session::PromptOrigin::TaskCompleted { task_id }) if task_id == "bg-normal"
+                state
+                    .pending_inputs
+                    .front()
+                    .map(|item| item.input_origin.as_prompt_origin()),
+                Some(crate::session::PromptOrigin::TaskCompleted { task_id })
+                    if task_id == "bg-normal"
             ));
             drop(state);
             let resources = actor
@@ -446,19 +448,16 @@ async fn task_completion_wake_is_admitted_without_cancel_barrier() {
                     )
                     .await
             });
-            tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    async {
-                        loop {
-                            if already_reported(&actor, "bg-normal").await {
-                                break;
-                            }
-                            tokio::task::yield_now().await;
-                        }
-                    },
-                )
-                .await
-                .expect("synthetic turn marked completion reported");
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if already_reported(&actor, "bg-normal").await {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("synthetic turn marked completion reported");
             turn.abort();
             assert!(
                 already_reported(&actor, "bg-normal").await,
@@ -633,7 +632,7 @@ async fn genuine_user_start_consumes_deferred_completions_without_notification_t
             assert!(state.notifications_suppressed);
             assert!(state.pending_notifications.is_empty());
             assert!(state.pending_inputs.iter().all(|input| !matches!(
-                input.origin,
+                input.input_origin.as_prompt_origin(),
                 crate::session::PromptOrigin::NotificationDrain
             )));
             drop(state);
@@ -641,7 +640,7 @@ async fn genuine_user_start_consumes_deferred_completions_without_notification_t
             SessionActor::maybe_drain_notifications(actor.clone(), completion_tx).await;
             let state = actor.state.lock().await;
             assert!(state.pending_inputs.iter().all(|input| !matches!(
-                input.origin,
+                input.input_origin.as_prompt_origin(),
                 crate::session::PromptOrigin::NotificationDrain
             )));
             drop(state);
@@ -1443,7 +1442,7 @@ async fn drain_drops_goal_turn_origin_when_status_none_and_marks_reported() {
                     .push(bash_completed_notification("bg-goal"));
             }
             let (completion_tx, _completion_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+                tokio::sync::mpsc::unbounded_channel::<TurnCompletionMsg>();
             std::sync::Arc::clone(&actor)
                 .maybe_drain_notifications(completion_tx)
                 .await;
@@ -1496,7 +1495,7 @@ async fn reparented_harness_subagent_task_suppressed_when_status_not_active() {
                     .push(bash_completed_notification("bg-skeptic"));
             }
             let (completion_tx, _completion_rx) =
-                tokio::sync::mpsc::unbounded_channel::<(String, PromptTurnResult)>();
+                tokio::sync::mpsc::unbounded_channel::<TurnCompletionMsg>();
             std::sync::Arc::clone(&actor)
                 .maybe_drain_notifications(completion_tx)
                 .await;
@@ -1569,6 +1568,7 @@ async fn between_turn_drain_suppresses_reserved_subagents() {
                             subagent_id: id.into(),
                             subagent_type: "general-purpose".into(),
                             description: format!("desc {id}"),
+                            loop_task_id: None,
                             success: true,
                             duration_ms: 1000,
                             tool_calls: 3,

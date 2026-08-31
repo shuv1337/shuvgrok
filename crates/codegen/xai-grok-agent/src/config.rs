@@ -238,6 +238,9 @@ fn grok_computer_toolset() -> ToolServerConfig {
         (&grok_build::GrepTool).into(),
         (&grok_build::KillTerminalCommandTool).into(),
         (&grok_build::GetTerminalCommandOutputTool).into(),
+        (&grok_build::SchedulerCreateTool).into(),
+        (&grok_build::SchedulerDeleteTool).into(),
+        (&grok_build::SchedulerListTool).into(),
     ];
     ToolServerConfig {
         tools,
@@ -295,30 +298,38 @@ pub fn toolset_for_preset(preset: &str) -> Option<ToolServerConfig> {
         .or_else(|| registered_toolset_preset(&normalized))
 }
 fn default_grok_build_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(true)
+}
+/// Same as the parent grok-build list, without `workflow`. The usual
+/// `general-purpose` spawn path must not add that tool and then strip it.
+fn general_purpose_toolset() -> ToolServerConfig {
+    grok_build_core_toolset(false)
+}
+fn grok_build_core_toolset(include_workflow: bool) -> ToolServerConfig {
+    let mut tools = vec![
+        bash_tool_config(),
+        (&grok_build::ReadFileTool).into(),
+        (&grok_build::SearchReplaceTool).into(),
+        (&grok_build::ListDirTool).into(),
+        (&grok_build::GrepTool).into(),
+        kill_task_tool_config(),
+        (&grok_build::TodoWriteTool).into(),
+        task_output_tool_config(),
+        wait_tasks_tool_config(),
+        task_tool_config(),
+        (&grok_build::SchedulerCreateTool).into(),
+        (&grok_build::SchedulerDeleteTool).into(),
+        (&grok_build::SchedulerListTool).into(),
+        (&grok_build::MonitorTool).into(),
+        (&search_tool::SearchTool).into(),
+        (&use_tool::UseTool).into(),
+        (&grok_build::UpdateGoalTool).into(),
+    ];
+    if include_workflow {
+        tools.push((&grok_build::WorkflowTool).into());
+    }
     ToolServerConfig {
-        tools: vec![
-            bash_tool_config(),
-            (&grok_build::ReadFileTool).into(),
-            (&grok_build::SearchReplaceTool).into(),
-            (&grok_build::ListDirTool).into(),
-            (&grok_build::GrepTool).into(),
-            kill_task_tool_config(),
-            (&grok_build::TodoWriteTool).into(),
-            task_output_tool_config(),
-            wait_tasks_tool_config(),
-            task_tool_config(),
-            (&grok_build::SchedulerCreateTool).into(),
-            (&grok_build::SchedulerDeleteTool).into(),
-            (&grok_build::SchedulerListTool).into(),
-            (&grok_build::MonitorTool).into(),
-            (&search_tool::SearchTool).into(),
-            (&use_tool::UseTool).into(),
-            (&grok_build::UpdateGoalTool).into(),
-            (&grok_build::WorkflowTool).into(),
-        ]
-        .into_iter()
-        .chain(sky_desktop_tools())
-        .collect(),
+        tools: tools.into_iter().chain(sky_desktop_tools()).collect(),
         behavior_preset: None,
     }
 }
@@ -1428,7 +1439,7 @@ impl AgentDefinition {
     fn scope_from_path(path: &Path) -> AgentScope {
         let path_str = path.to_string_lossy();
         let grok = xai_grok_config::user_grok_home();
-        let home = dirs::home_dir();
+        let home = xai_dirs::home_dir();
         for (dir, scope) in crate::discovery::user_agent_dirs(home.as_deref(), grok.as_deref()) {
             if path.starts_with(&dir) {
                 return scope;
@@ -1657,6 +1668,7 @@ impl AgentDefinition {
             description: xai_tool_types::GENERAL_PURPOSE_SUBAGENT
                 .description
                 .to_string(),
+            tool_config: general_purpose_toolset(),
             prompt_body: Some(subagent_prompts::GENERAL_PURPOSE_PROMPT.to_string()),
             ..Self::base(BuiltinAgentName::GeneralPurpose, "")
         }
@@ -1770,6 +1782,18 @@ mod tests {
             .name_override
             .expect("task tool is renamed");
         assert!(xai_grok_tools::is_task_tool_id(&name));
+    }
+    /// Pins the `run_terminal_command` rename to the writing-phase taxonomy
+    /// so a future rename can't silently degrade the spinner label.
+    #[test]
+    fn bash_tool_rename_matches_writing_tool_kind() {
+        let name = bash_tool_config()
+            .name_override
+            .expect("bash tool is renamed");
+        assert_eq!(
+            xai_grok_tools::tool_taxonomy::writing_tool_kind(&name),
+            Some(xai_grok_tools::types::tool::ToolKind::Execute)
+        );
     }
     /// Native presets only.
     #[test]

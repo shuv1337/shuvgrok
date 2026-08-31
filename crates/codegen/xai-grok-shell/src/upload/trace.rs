@@ -1151,8 +1151,8 @@ impl TraceExportSource for DynamicResolver {
                 ref mut user_token, ..
             } = config.upload_method
             {
-                match self.auth_manager.auth_background().await {
-                    Ok(auth) => *user_token = auth.key,
+                match self.auth_manager.get_valid_token().await {
+                    Ok(key) => *user_token = key,
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
@@ -2578,7 +2578,7 @@ mod tests {
     }
     /// Project dir under $HOME so `is_project_dir` passes; None in sandboxes or git-repo homes.
     fn home_project_dir() -> Option<tempfile::TempDir> {
-        let home = dirs::home_dir()?;
+        let home = xai_dirs::home_dir()?;
         if home.ancestors().any(|p| p.join(".git").exists()) {
             return None;
         }

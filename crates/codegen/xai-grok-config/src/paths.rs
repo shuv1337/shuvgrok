@@ -1,61 +1,14 @@
 //! Filesystem locations for grok config files and binaries.
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
-static GROK_HOME: OnceLock<PathBuf> = OnceLock::new();
+pub use xai_dirs::{default_grok_home, grok_home, user_grok_home};
 
 #[cfg(target_os = "macos")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str =
     "/Library/Application Support/ClaudeCode/managed-settings.json";
 #[cfg(target_os = "linux")]
 const CLAUDE_MANAGED_SETTINGS_PATH: &str = "/etc/claude-code/managed-settings.json";
-
-/// The default user grok directory (`~/.grok`, canonicalized) used when
-/// `GROK_HOME` is unset. Exposed so callers (e.g. display helpers) can detect
-/// whether [`grok_home()`] is the default without duplicating the computation.
-///
-/// Uses [`dunce::canonicalize`] instead of [`std::fs::canonicalize`]: on
-/// Windows, std returns a verbatim path (`\\?\C:\Users\...`) which external
-/// tools choke on — e.g. `git clone` rejects `\\?\` destinations with
-/// "Invalid argument", breaking marketplace cache clones under
-/// `~/.grok/marketplace-cache`. `dunce` strips the prefix whenever the path
-/// is safely representable in legacy form; on non-Windows it is identical to
-/// `std::fs::canonicalize`.
-///
-/// Keep the dunce canonicalization in sync with the hand-rolled duplicate in
-/// `xai_fast_worktree::db::resolve_grok_home` (deliberately standalone crate).
-pub fn default_grok_home() -> PathBuf {
-    #[allow(deprecated)]
-    let home = std::env::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    dunce::canonicalize(&home).unwrap_or(home).join(".grok")
-}
-
-/// Per-user config directory: `$GROK_HOME` or `~/.grok`. Created if needed.
-pub fn grok_home() -> PathBuf {
-    GROK_HOME
-        .get_or_init(|| {
-            let grok_home = if let Ok(v) = std::env::var("GROK_HOME") {
-                PathBuf::from(v)
-            } else {
-                default_grok_home()
-            };
-            let _ = std::fs::create_dir_all(&grok_home);
-            grok_home
-        })
-        .clone()
-}
-
-/// The user-global grok home, but only when one genuinely resolves: `Some` when
-/// `$GROK_HOME` is set or a home directory is found, `None` otherwise. Unlike
-/// [`grok_home()`], this never falls back to a cwd-relative `.grok`, so callers
-/// that *scan* user-global grok resources (hooks, marketplace sources, ...) don't
-/// mistake a project's `.grok` tree for the user-global one when no home resolves.
-pub fn user_grok_home() -> Option<PathBuf> {
-    #[allow(deprecated)]
-    let resolvable = std::env::var_os("GROK_HOME").is_some() || std::env::home_dir().is_some();
-    resolvable.then(grok_home)
-}
 
 /// Canonical grok application path: `$GROK_HOME/bin/grok` (Unix) or `grok.exe` (Windows).
 pub fn grok_application() -> PathBuf {
@@ -232,6 +185,11 @@ pub fn ensure_sessions_cwd_dir_in(
         match std::fs::File::create_new(&cwd_file) {
             Ok(mut f) => {
                 std::io::Write::write_all(&mut f, cwd.as_bytes())?;
+                // Fsync the write-capable create_new handle before drop.
+                // A later parent-dir sync would otherwise freeze a present
+                // but empty/torn marker that path recovery cannot fall back
+                // from. AlreadyExists skips rewrite (O_EXCL).
+                f.sync_all()?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(e),
@@ -357,16 +315,6 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             assert_eq!(decode_cwd_from_dirname(&dir).as_deref(), Some(cwd));
         }
-    }
-
-    #[test]
-    fn default_grok_home_has_no_verbatim_prefix() {
-        // On Windows, std::fs::canonicalize returns `\\?\C:\...` verbatim
-        // paths that external tools (notably `git clone`) reject. The dunce
-        // canonicalization must yield a plain path. No-op assertion on Unix.
-        let home = default_grok_home();
-        assert!(!home.to_string_lossy().starts_with(r"\\?\"));
-        assert!(home.ends_with(".grok"));
     }
 
     #[cfg(unix)]

@@ -184,13 +184,10 @@ impl Harness {
             .current_prompt_id
             .lock()
             .expect("current_prompt_id mutex poisoned") = Some(prompt_id.to_string());
-        self.actor.state.lock().await.running_task = Some(AgentTask {
-            prompt_id: prompt_id.into(),
-            handle,
-        });
+        self.actor.state.lock().await.running_task = Some(AgentTask::new(prompt_id, handle));
     }
 
-    async fn cancel(&self, trigger: CancelTrigger) -> super::tasks_cancel::CancelOutcome {
+    async fn cancel(&self, trigger: CancelTrigger) -> super::cancel::CancelOutcome {
         self.cancel_with(trigger, true).await
     }
 
@@ -198,7 +195,7 @@ impl Harness {
         &self,
         trigger: CancelTrigger,
         cancel_subagents: bool,
-    ) -> super::tasks_cancel::CancelOutcome {
+    ) -> super::cancel::CancelOutcome {
         self.actor
             .cancel_running_task(crate::session::CancelOptions {
                 cancel_subagents,
@@ -394,7 +391,9 @@ async fn a_rewind_reports_nothing_but_still_settles_the_session() {
         let outcome = h
             .actor
             .cancel_running_task(crate::session::CancelOptions {
-                rewind_if_no_output: true,
+                history: crate::session::CancelHistoryDisposition::RewindIfNoOutput {
+                    prompt_id: None,
+                },
                 trigger: Some(CancelTrigger::Esc),
                 user_initiated: true,
                 ..Default::default()
@@ -439,12 +438,14 @@ async fn a_subagent_session_end_names_the_child() {
 
         let mut parent = Harness::new().await;
         parent.listen(&events);
-        super::run_loop::fire_session_end_hooks(&parent.actor, "shutdown").await;
+        let timer = xai_grok_telemetry::session_end::SessionEndTimer::new_shared();
+        super::run_loop::fire_session_end_hooks(&parent.actor, "shutdown", &timer).await;
         assert_eq!(parent.fired(), vec!["session_end", "stop"]);
 
         let mut child = Harness::subagent().await;
         child.listen(&events);
-        super::run_loop::fire_session_end_hooks(&child.actor, "shutdown").await;
+        let child_timer = xai_grok_telemetry::session_end::SessionEndTimer::new_shared();
+        super::run_loop::fire_session_end_hooks(&child.actor, "shutdown", &child_timer).await;
         let fired = child.fired_payloads();
         assert_eq!(
             fired.len(),
@@ -804,6 +805,7 @@ async fn a_completion_arriving_after_its_cancel_reports_nothing() {
                     usage: None,
                     tool_overrides: None,
                 }),
+                Some(0),
             )
             .await;
         h.drain_turn_ends().await;
@@ -835,6 +837,7 @@ async fn a_completion_reports_its_own_cancel_reason() {
             .handle_completion(
                 "p1".into(),
                 ok(PromptCompletionKind::MaxTurnsReached { limit: 1 }),
+                Some(0),
             )
             .await;
 
@@ -854,6 +857,7 @@ async fn a_completion_reports_its_own_cancel_reason() {
                         trigger: Some(format!("ctrl_c{}", "y".repeat(2000))),
                     }),
                 }),
+                Some(0),
             )
             .await;
         h.drain_turn_ends().await;

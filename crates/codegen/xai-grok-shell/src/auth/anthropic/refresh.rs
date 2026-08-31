@@ -83,7 +83,6 @@ impl TokenRefresher for AnthropicRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("Failed to build HTTP client: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };
@@ -106,7 +105,6 @@ impl TokenRefresher for AnthropicRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("Anthropic refresh network error: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };
@@ -126,7 +124,6 @@ impl TokenRefresher for AnthropicRefresher {
             }
             return RefreshOutcome::TransientFailure {
                 message: format!("Anthropic refresh HTTP error ({status}): {body}"),
-                suspect_consumed_rt: None,
             };
         }
 
@@ -135,7 +132,6 @@ impl TokenRefresher for AnthropicRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("Failed to parse Anthropic refresh response: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };

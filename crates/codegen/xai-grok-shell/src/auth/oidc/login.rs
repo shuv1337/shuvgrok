@@ -287,7 +287,7 @@ mod tests {
             &redirect_uri,
             &pkce,
             &state,
-            TEST_NONCE,
+            &test_nonce(),
         );
 
         // Simulate browser callback via race_callback_and_stdin
@@ -327,7 +327,7 @@ mod tests {
             &discovery,
             &oidc_cfg.issuer,
             &oidc_cfg.client_id,
-            TEST_NONCE,
+            &test_nonce(),
             None,
             None,
             None,

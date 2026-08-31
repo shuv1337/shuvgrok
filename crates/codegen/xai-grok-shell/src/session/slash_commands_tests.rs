@@ -1,10 +1,10 @@
 use super::*;
 use xai_grok_tools::implementations::skills::types::SkillScope;
 
-/// Shadows [`super::resolve`] for the cases that route something other
+/// Shadows [`super::resolve_human_intent`] for the cases that route something other
 /// than `/loop`: they are indifferent to the fire mode, and pinning it
 /// here keeps a plumbing change out of every unrelated call site. Tests
-/// that care about the mode call `super::resolve` directly.
+/// that care about the mode call `super::resolve_human_intent` directly.
 fn resolve(
     prompt_blocks: Vec<acp::ContentBlock>,
     skills: &[SkillInfo],
@@ -12,7 +12,7 @@ fn resolve(
     skill_rewrite: SkillSlashRewrite,
     workflows: &[crate::session::workflow::registry::WorkflowListing],
 ) -> Result<Vec<acp::ContentBlock>, SlashCommandOutcome> {
-    super::resolve(
+    super::resolve_human_intent(
         prompt_blocks,
         skills,
         availability,
@@ -183,38 +183,6 @@ fn invoke_text(outcome: SlashCommandOutcome) -> String {
     }
 }
 
-// ── parse_slash_prefix ──────────────────────────────────────────
-
-#[test]
-fn parse_slash_prefix_extracts_name_and_args() {
-    assert_eq!(
-        parse_slash_prefix(&[text_block("/compact keep auth")]),
-        Some(("compact", "keep auth")),
-    );
-    assert_eq!(
-        parse_slash_prefix(&[text_block("/yolo")]),
-        Some(("yolo", "")),
-    );
-}
-
-#[test]
-fn parse_slash_prefix_ignores_non_leading_slash() {
-    assert_eq!(
-        parse_slash_prefix(&[text_block("please run /commit")]),
-        None
-    );
-    assert_eq!(parse_slash_prefix(&[text_block("fix the bug")]), None);
-    assert_eq!(parse_slash_prefix(&[text_block("/")]), None);
-}
-
-#[test]
-fn parse_slash_prefix_trims_whitespace() {
-    assert_eq!(
-        parse_slash_prefix(&[text_block("  /commit fix typo  ")]),
-        Some(("commit", "fix typo")),
-    );
-}
-
 // ── builtin resolve fns ─────────────────────────────────────────
 
 fn resolve_builtin(name: &str, args: &str) -> Option<BuiltinAction> {
@@ -303,6 +271,86 @@ fn status_alias_resolves_to_session_info() {
         outcome,
         SlashCommandOutcome::Builtin(BuiltinAction::SessionInfo)
     ));
+}
+
+#[test]
+fn resolve_model_authored_skill_requires_exact_child_catalog_name_and_loader() {
+    let skills = vec![make_skill("commit", true), make_skill("other", true)];
+
+    let outcome = super::resolve_model_authored_skill(
+        vec![text_block("/commit fix typo")],
+        "commit",
+        "fix typo",
+        &skills,
+        all_gated(),
+        true,
+    )
+    .unwrap_err();
+    let skill = first_skill(outcome);
+    assert_eq!(skill.name, "commit");
+    assert_eq!(skill.args, "fix typo");
+
+    for (name, has_skill_loader) in [
+        ("Commit", true),
+        ("local:commit", true),
+        ("missing", true),
+        ("commit", false),
+        ("always-approve", true),
+    ] {
+        assert!(
+            super::resolve_model_authored_skill(
+                vec![text_block(&format!("/{name}"))],
+                name,
+                "",
+                &skills,
+                all_gated(),
+                has_skill_loader,
+            )
+            .is_ok(),
+            "{name} with loader={has_skill_loader} must stay inert"
+        );
+    }
+
+    let colliding = vec![make_skill("compact", true)];
+    let outcome = super::resolve_model_authored_skill(
+        vec![text_block("/local:compact keep history")],
+        "local:compact",
+        "keep history",
+        &colliding,
+        all_gated(),
+        true,
+    )
+    .unwrap_err();
+    let skill = first_skill(outcome);
+    assert_eq!(skill.name, "local:compact");
+    assert_eq!(skill.args, "keep history");
+
+    let flush_skill = vec![make_skill("flush", true)];
+    let memory_off = CommandAvailability::default();
+    let advertised = available_commands(&flush_skill, memory_off, &[]);
+    assert!(advertised.iter().any(|command| command.name == "flush"));
+    assert!(
+        super::resolve_model_authored_skill(
+            vec![text_block("/flush")],
+            "flush",
+            "",
+            &flush_skill,
+            memory_off,
+            true,
+        )
+        .is_err()
+    );
+    assert!(
+        super::resolve_model_authored_skill(
+            vec![text_block("/local:flush")],
+            "local:flush",
+            "",
+            &flush_skill,
+            memory_off,
+            true,
+        )
+        .is_ok()
+    );
 }
 
 #[test]
@@ -441,7 +489,7 @@ fn resolve_loop_without_args_uses_bare_command_display_text() {
 #[test]
 fn resolve_loop_expands_for_the_sessions_fire_mode() {
     let text_of = |mode| {
-        let outcome = super::resolve(
+        let outcome = super::resolve_human_intent(
             vec![text_block("/loop 1m echo hello")],
             &[],
             all_gated(),
@@ -748,11 +796,6 @@ fn loop_instruction_derives_interval_without_default_or_inline_execute() {
     assert!(instr.contains("30 minutes"));
     assert!(instr.contains("<number><unit>"));
     assert!(instr.contains("ask the user how often"));
-    assert!(instr.contains("Do NOT execute the prompt inline"));
-    assert!(
-        !instr.contains("immediately execute the parsed prompt"),
-        "stale inline-execute wording must be gone: {instr}"
-    );
     assert!(instr.contains("every 30 minutes do x"));
 }
 
@@ -1692,6 +1735,92 @@ fn listing(name: &str) -> crate::session::workflow::registry::WorkflowListing {
 }
 
 #[test]
+fn same_named_builtin_projects_workflow_metadata_without_replacing_command() {
+    let workflow = crate::session::workflow::registry::WorkflowListing {
+        name: "deep-research".to_string(),
+        description: "Workflow metadata description".to_string(),
+        when_to_use: None,
+        source: "builtin",
+        path: None,
+    };
+    let commands = available_commands(&[], all_gated(), std::slice::from_ref(&workflow));
+    let matching: Vec<_> = commands
+        .iter()
+        .filter(|command| command.name == "deep-research")
+        .collect();
+    assert_eq!(matching.len(), 1);
+    let command = matching[0];
+    assert_eq!(
+        command.description,
+        "Research with bounded parallel agents, cross-check evidence, and write a cited report"
+    );
+    assert_eq!(
+        command.input,
+        Some(acp::AvailableCommandInput::Unstructured(
+            acp::UnstructuredCommandInput::new("<query>".to_string())
+        ))
+    );
+    let meta = command.meta.as_ref().expect("workflow metadata");
+    assert_eq!(
+        meta.get("workflowSource")
+            .and_then(serde_json::Value::as_str),
+        Some("builtin")
+    );
+    assert!(!meta.contains_key("workflowPath"));
+
+    assert!(matches!(
+        resolve(
+            vec![text_block("/deep-research rust pitfalls")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            std::slice::from_ref(&workflow),
+        )
+        .unwrap_err(),
+        SlashCommandOutcome::Builtin(BuiltinAction::DeepResearch { query })
+            if query == "rust pitfalls"
+    ));
+}
+
+#[test]
+fn ordinary_builtin_collisions_do_not_project_workflow_metadata() {
+    let mut status_workflow = listing("status");
+    status_workflow.source = "project";
+    let mut goal_workflow = listing("goal");
+    goal_workflow.source = "user";
+    let commands = available_commands(&[], all_gated(), &[status_workflow, goal_workflow]);
+
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.name == "session-info")
+            .count(),
+        1
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|command| command.name == "goal")
+            .count(),
+        1
+    );
+    assert!(commands.iter().all(|command| command.name != "status"));
+    for name in ["session-info", "goal"] {
+        let command = commands
+            .iter()
+            .find(|command| command.name == name)
+            .expect("builtin command");
+        assert!(
+            command
+                .meta
+                .as_ref()
+                .is_none_or(|meta| !meta.contains_key("workflowSource")),
+            "{name} must not expose a colliding saved workflow"
+        );
+    }
+}
+
+#[test]
 fn named_workflows_advertise_and_resolve() {
     let workflows = vec![listing("triage-flakes"), listing("goal")];
     let commands = available_commands(&[], all_gated(), &workflows);
@@ -1864,6 +1993,8 @@ fn workflow_manage_parses_both_orders_and_optional_id() {
         ("pause wf_12ab", "wf_12ab", "pause"),
         ("SAVE wf_12ab", "wf_12ab", "save"),
         ("pause deep research", "deep research", "pause"),
+        ("runs", "", "runs"),
+        ("RUNS", "", "runs"),
         ("", "", ""),
     ] {
         match resolve_workflow(args) {
@@ -1892,6 +2023,8 @@ fn workflow_manage_parses_both_orders_and_optional_id() {
             "triage",
             "resume the failed jobs",
         ),
+        // `runs` is only an op in the bare form; with args it stays a launch.
+        ("runs extra words", "runs", "extra words"),
     ] {
         match resolve_workflow(args) {
             BuiltinAction::WorkflowLaunch { name, input } => {
@@ -1904,6 +2037,37 @@ fn workflow_manage_parses_both_orders_and_optional_id() {
             ),
         }
     }
+}
+
+#[test]
+fn workflow_named_runs_is_shadowed_by_the_runs_op() {
+    // `/workflow runs` is always the overview op, even with a workflow named
+    // `runs` installed; that workflow still launches via its advertised bare
+    // `/runs` command or `/workflow runs <args>`.
+    let workflows = vec![listing("runs")];
+    assert!(matches!(
+        resolve(
+            vec![text_block("/workflow runs")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &workflows,
+        )
+        .unwrap_err(),
+        SlashCommandOutcome::Builtin(BuiltinAction::WorkflowManage { run_id, op })
+            if run_id.is_empty() && op == "runs"
+    ));
+    assert!(matches!(
+        resolve(
+            vec![text_block("/runs")],
+            &[],
+            all_gated(),
+            SkillSlashRewrite::default(),
+            &workflows,
+        )
+        .unwrap_err(),
+        SlashCommandOutcome::Builtin(BuiltinAction::WorkflowLaunch { name, .. }) if name == "runs"
+    ));
 }
 
 #[test]

@@ -78,16 +78,19 @@ impl SessionActor {
             screen_mode: None,
             verbatim: false,
             json_schema: None,
-            origin: super::super::PromptOrigin::User,
+            input_origin: InputOrigin::new(super::super::PromptOrigin::User),
             task_wake_fallback: None,
             tool_overrides_update: None,
             respond_to,
             persist_ack: None,
             parsed_prompt_tx: None,
+            initial_child_prompt_ready: None,
             queue_meta: None,
+            queue_mutation_policy: QueueMutationPolicy::hidden(),
             // Send-now semantics (see doc): a later real send-now must not
             // leapfrog this fallback in `queue_input`'s FIFO scan.
             send_now: front,
+            traceparent: None,
         };
         let mut state = self.state.lock().await;
         if front {
@@ -289,9 +292,11 @@ impl SessionActor {
             let has_held = {
                 let state = self.state.lock().await;
                 let running = state.running_prompt_id();
+                // Only editable human rows are promotable; protected pins and
+                // queue-hidden fallbacks must not arm steer promotion.
                 running.is_some()
                     && state.pending_inputs.iter().any(|item| {
-                        !item.origin.is_synthetic() && Some(item.prompt_id.as_str()) != running
+                        item.is_queue_editable() && Some(item.prompt_id.as_str()) != running
                     })
             };
             if has_held {

@@ -94,12 +94,15 @@ impl SkyRpc {
         });
         let mut line = request.to_string();
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).await.map_err(|error| {
-            xai_tool_runtime::ToolError::execution(
-                xai_tool_protocol::ToolId::new("sky").expect("id"),
-                format!("sky rpc write failed: {error}"),
-            )
-        })?;
+        self.stdin
+            .write_all(line.as_bytes())
+            .await
+            .map_err(|error| {
+                xai_tool_runtime::ToolError::execution(
+                    xai_tool_protocol::ToolId::new("sky").expect("id"),
+                    format!("sky rpc write failed: {error}"),
+                )
+            })?;
         self.stdin.flush().await.map_err(|error| {
             xai_tool_runtime::ToolError::execution(
                 xai_tool_protocol::ToolId::new("sky").expect("id"),
@@ -110,12 +113,16 @@ impl SkyRpc {
         tokio::time::timeout(Duration::from_secs(timeout_secs()), async {
             loop {
                 response.clear();
-                let n = self.stdout.read_line(&mut response).await.map_err(|error| {
-                    xai_tool_runtime::ToolError::execution(
-                        xai_tool_protocol::ToolId::new("sky").expect("id"),
-                        format!("sky rpc read failed: {error}"),
-                    )
-                })?;
+                let n = self
+                    .stdout
+                    .read_line(&mut response)
+                    .await
+                    .map_err(|error| {
+                        xai_tool_runtime::ToolError::execution(
+                            xai_tool_protocol::ToolId::new("sky").expect("id"),
+                            format!("sky rpc read failed: {error}"),
+                        )
+                    })?;
                 if n == 0 {
                     return Err(xai_tool_runtime::ToolError::execution(
                         xai_tool_protocol::ToolId::new("sky").expect("id"),
@@ -145,7 +152,10 @@ impl SkyRpc {
                         error.to_owned(),
                     ));
                 }
-                let result = value.get("result").cloned().unwrap_or(serde_json::json!({}));
+                let result = value
+                    .get("result")
+                    .cloned()
+                    .unwrap_or(serde_json::json!({}));
                 let text = result
                     .get("text")
                     .and_then(serde_json::Value::as_str)

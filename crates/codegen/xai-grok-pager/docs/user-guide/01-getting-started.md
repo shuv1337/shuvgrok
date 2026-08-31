@@ -46,6 +46,16 @@ Update to the latest version at any time:
 shuvgrok update
 ```
 
+To fetch a repository through Grove (NFS on macOS, FUSE on Linux) after
+`[clone] enabled = true` in Grove config:
+
+```bash
+shuvgrok clone <url> [dir]
+```
+
+The default is a depth-1 checkout of the selected branch. Pass `--full-history`
+for a complete clone. See [grok clone](27-grok-clone.md).
+
 ---
 
 ## First Launch
@@ -183,7 +193,7 @@ Tools can be extended with [MCP servers](05-configuration.md#mcp-servers) for in
 Type `/` in the prompt to access commands. These provide quick actions without writing a full prompt:
 
 ```
-/model grok-build                 # Switch model
+/model grok-4.6                 # Switch model
 /compact                          # Compress conversation history
 /always-approve                   # Toggle always-approve mode
 /new                              # Start a new session
@@ -218,7 +228,7 @@ shuvgrok --rules "Always use TypeScript. Prefer functional components."
 shuvgrok --yolo
 
 # Use a specific model
-shuvgrok -m grok-build
+shuvgrok -m grok-4.6
 
 # Resume a previous session
 shuvgrok --resume <session-id>

@@ -83,7 +83,6 @@ impl TokenRefresher for CodexRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("Failed to build HTTP client: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };
@@ -99,7 +98,6 @@ impl TokenRefresher for CodexRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("OpenAI refresh network error: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };
@@ -119,7 +117,6 @@ impl TokenRefresher for CodexRefresher {
             }
             return RefreshOutcome::TransientFailure {
                 message: format!("OpenAI refresh HTTP error ({status}): {body}"),
-                suspect_consumed_rt: None,
             };
         }
 
@@ -128,7 +125,6 @@ impl TokenRefresher for CodexRefresher {
             Err(e) => {
                 return RefreshOutcome::TransientFailure {
                     message: format!("Failed to parse OpenAI refresh response: {e}"),
-                    suspect_consumed_rt: None,
                 };
             }
         };

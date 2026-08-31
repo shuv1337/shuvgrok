@@ -2,6 +2,7 @@ pub mod anthropic;
 pub(crate) mod api_key_probe;
 pub(crate) mod attribution;
 mod auth_provider;
+pub(crate) mod backend;
 mod config;
 pub mod credential_provider;
 #[path = "devbox_login_stub.rs"]
@@ -16,6 +17,7 @@ mod model;
 pub mod oidc;
 pub mod openai_codex;
 pub mod pkce_loopback;
+mod pre_tui;
 pub mod providers;
 pub(crate) mod recovery;
 pub(crate) mod refresh;
@@ -37,6 +39,9 @@ pub use config::{
     ForceLoginTeam, GrokComConfig, OAuth2ProviderConfig, OidcAuthConfig, PreferredAuthMethod,
     XAI_OAUTH2_ISSUER, is_xai_oauth2_issuer, xai_oauth2_issuer,
 };
+pub(crate) use config::{
+    force_login_team_from_env, force_login_team_from_requirements, resolve_force_login_team,
+};
 pub(crate) use external_auth::{parse_output, refresh_with_command};
 pub(crate) use flow::{
     AuthChannels, mint_session_noninteractive, run_auth_flow, run_auth_flow_with_stderr_bridge,
@@ -49,6 +54,7 @@ pub use flow::{
     run_provider_login, try_ensure_fresh_auth,
 };
 pub use jwt::{is_jwt_expired_or_near, parse_jwt_expiration};
+pub use pre_tui::{PreTuiLoginOutcome, maybe_run_pre_tui_external_login};
 mod meta;
 pub use error::{AuthError, RefreshTokenError, RefreshTokenFailedReason};
 pub use manager::{AuthManager, shared_api_key_provider};
