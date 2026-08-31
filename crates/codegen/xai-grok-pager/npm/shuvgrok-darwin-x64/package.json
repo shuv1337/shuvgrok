@@ -1,6 +1,6 @@
 {
     "name": "@shuv1337/shuvgrok-darwin-x64",
-    "version": "1.0.5",
+    "version": "1.0.6",
     "description": "darwin-x64 binary for @shuv1337/shuvgrok. Do not install directly; install @shuv1337/shuvgrok instead.",
     "license": "Apache-2.0",
     "repository": {
