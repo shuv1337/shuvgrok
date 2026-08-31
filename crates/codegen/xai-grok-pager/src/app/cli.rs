@@ -32,10 +32,10 @@ pub enum Command {
         /// Ignored (kept for backwards compatibility). OAuth2 is now the only auth method.
         #[arg(long, hide = true)]
         legacy: bool,
-        /// Use Grok OAuth via auth.x.ai.
+        /// Force the browser/loopback OAuth flow (instead of device-code).
         #[arg(long = "oauth", alias = "oidc", conflicts_with_all = ["device_auth"])]
         oauth: bool,
-        /// Use device-code authentication for headless/remote environments.
+        /// Use device-code authentication. Default for ChatGPT on SSH / no-display hosts.
         #[arg(
             long = "device-auth",
             visible_alias = "device-code",

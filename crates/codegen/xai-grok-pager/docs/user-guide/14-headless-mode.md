@@ -574,6 +574,7 @@ For headless use, authenticate with one of:
 - **`XAI_API_KEY`**: simplest for CI. See [Environment Variables](#environment-variables-for-headless) above.
 - **`shuvgrok login --device-auth`** (or `--device-code`): no browser needed on the target machine.
   See [Authentication > Device Code Flow](02-authentication.md#device-code-flow).
+- **`shuvgrok login --provider openai-codex`**: ChatGPT device-code login is selected automatically on SSH / no-display hosts.
 - **`shuvgrok login`**: browser-based OAuth2 on machines with a GUI.
 
 If you've previously logged in, cached credentials are used automatically.

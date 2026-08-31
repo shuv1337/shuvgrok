@@ -36,7 +36,7 @@ Running `shuvgrok login` starts the sign-in flow again, replacing your cached se
 |------|-------------|
 | `--provider <id>` | Choose which provider to sign in to: `xai` (default), `anthropic`, or `openai-codex`. Omitting it on an interactive terminal shows a picker. |
 | `--oauth` | Sign in through SpaceXAI OAuth at `auth.x.ai`. This is the default, so the flag is optional. |
-| `--device-auth` (alias `--device-code`) | Sign in with the device-code flow for headless or remote environments. Supported for `xai` and `openai-codex`. |
+| `--device-auth` (alias `--device-code`) | Sign in with the device-code flow. Supported for `xai` and `openai-codex`. ChatGPT also selects this automatically on SSH / no-display hosts. |
 
 To sign out, run `shuvgrok logout`. Pass `--provider <id>` to sign out of a single
 provider; without it, the xAI session is cleared.
@@ -69,12 +69,18 @@ shuvgrok login --provider anthropic       # Claude Pro / Max
 shuvgrok login --provider openai-codex    # ChatGPT Plus / Pro
 ```
 
-Both open your browser and complete an OAuth 2.0 PKCE flow. If the browser
-cannot reach the CLI (remote VM, SSH), paste the callback URL — or just the
-authorization code — back into the terminal; Grok races the loopback listener
-against your paste and takes whichever arrives first.
+Both open your browser and complete an OAuth 2.0 PKCE flow.
 
-ChatGPT also supports a fully headless device flow:
+**Remote / no GUI.** ChatGPT login uses the device-code flow automatically on
+SSH sessions and on Linux hosts with no display — you open a URL and code on
+any machine, no localhost callback. Pass `--oauth` to force the browser flow
+instead. Claude has no device flow; open the authorize URL on any machine. If
+the redirect to `localhost` fails (expected when the browser is not on the
+same host as the CLI), copy the **full callback URL** from the address bar
+(`http://localhost:…/callback?code=…`) and paste it into the terminal or the
+TUI paste box.
+
+To force ChatGPT device login even when a display is present:
 
 ```bash
 shuvgrok login --provider openai-codex --device-auth
@@ -335,9 +341,10 @@ For headless environments (SSH sessions, Docker containers, remote VMs) where no
 
 ```bash
 shuvgrok login --device-auth    # or: shuvgrok login --device-code
+shuvgrok login --provider openai-codex   # device-code is automatic with no display
 ```
 
-This prints a URL and code to the terminal. Open the URL on any device, enter the code, and complete authentication. Grok polls until the login is confirmed.
+This prints a URL and code to the terminal. Open the URL on any device, enter the code, and complete authentication. Grok polls until the login is confirmed. ChatGPT (`--provider openai-codex`) picks this flow automatically when no GUI is detected; xAI still defaults to browser login unless you pass `--device-auth`. Claude does not support device-code login — paste the callback URL instead (see [Alternative Providers](#alternative-providers-claude-promax-chatgpt-pluspro)).
 
 You can also implement the device-code flow through an [External Auth Provider](#external-auth-provider) for full control.
 

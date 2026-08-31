@@ -1282,8 +1282,8 @@ struct AuthRequestMeta {
     headless: bool,
     #[serde(default)]
     reauth: bool,
-    /// `--oauth`: force loopback. The only transport override sent over ACP
-    /// (loopback is the default; device is opt-in via env/config).
+    /// `--oauth`: force loopback. Otherwise ChatGPT may auto-select device
+    /// login on SSH / no-display hosts; xAI still defaults to loopback.
     #[serde(default)]
     use_oauth: bool,
     /// When true, skip cached tokens and force the interactive browser login
@@ -1313,7 +1313,8 @@ impl AuthRequestMeta {
             .filter(|p| p.is_enabled())
     }
 
-    /// `--oauth` → force loopback; otherwise default (loopback).
+    /// `--oauth` → force loopback; otherwise no override (ChatGPT may
+    /// auto-select device login when there is no GUI).
     fn login_override(&self) -> crate::auth::LoginTransportOverride {
         if self.use_oauth {
             crate::auth::LoginTransportOverride::ForceLoopback

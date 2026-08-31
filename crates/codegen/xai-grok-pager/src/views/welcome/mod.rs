@@ -1015,6 +1015,10 @@ const AUTH_HEADER: &str = "A browser window will open for authentication.";
 const DEVICE_AUTH_HEADER: &str = "Approve in your browser to finish signing in.";
 /// Caption beneath the device code.
 const DEVICE_CODE_CAPTION: &str = "Make sure your browser shows this code.";
+/// Loopback recovery: the remote browser hits localhost and fails; the
+/// address bar still holds the callback URL with `code`.
+const LOOPBACK_PASTE_HINT: &str = "If localhost fails, paste the callback URL below.";
+const LOOPBACK_PASTE_PLACEHOLDER: &str = "Paste callback URL...";
 
 /// Extract `user_code` from a device verification URL (`None` if absent or malformed).
 /// It is shown on-screen so the user can confirm it matches the browser before approving (anti-phishing).
@@ -1374,9 +1378,11 @@ fn render_welcome_authenticating(
                 );
             }
 
+            let paste_hint_rows = (LOOPBACK_PASTE_HINT.len() as u16).div_ceil(inner_width);
             let msg_height = if auth_url.is_some() {
                 let header_rows = (AUTH_HEADER.len() as u16).div_ceil(inner_width);
-                header_rows + auth_copy_block_rows(inner_width)
+                // copy block + blank + paste hint
+                header_rows + auth_copy_block_rows(inner_width) + 1 + paste_hint_rows
             } else {
                 1u16
             };
@@ -1406,6 +1412,14 @@ fn render_welcome_authenticating(
                     .alignment(Alignment::Center),
                 );
                 push_auth_copy_block(&mut lines, theme, clipboard_delivery);
+                lines.push(Line::default());
+                lines.push(
+                    Line::from(Span::styled(
+                        LOOPBACK_PASTE_HINT,
+                        Style::default().fg(theme.gray),
+                    ))
+                    .alignment(Alignment::Center),
+                );
             } else {
                 lines.push(
                     Line::from(Span::styled(
@@ -2646,7 +2660,7 @@ fn build_masked_auth_token(input: &str, cursor_byte: usize) -> MaskedAuthToken {
 
 fn masked_auth_token_view(input: &str, cursor_byte: usize, width: usize) -> (String, usize) {
     if input.is_empty() {
-        return ("Paste your token here...".to_string(), 0);
+        return (LOOPBACK_PASTE_PLACEHOLDER.to_string(), 0);
     }
     let masked = build_masked_auth_token(input, cursor_byte);
     let buffer =
@@ -2736,7 +2750,7 @@ mod tests {
     fn masked_auth_token_preserves_reveal_policy() {
         assert_eq!(
             masked_auth_token_view("", 0, 24),
-            ("Paste your token here...".to_string(), 0)
+            (LOOPBACK_PASTE_PLACEHOLDER.to_string(), 0)
         );
         assert_eq!(build_masked_auth_token("12345678", 8).display, "12345678");
         assert_eq!(build_masked_auth_token("123456789", 9).display, "•••••6789");
@@ -3965,6 +3979,45 @@ mod tests {
         assert!(
             second.starts_with(&url[40..]),
             "wrapped remainder must start at column 0:\n{text}"
+        );
+    }
+
+    #[test]
+    fn loopback_auth_arm_prompts_to_paste_callback_url() {
+        let area = Rect::new(0, 0, 80, 40);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::current();
+        let url = "https://claude.ai/oauth/authorize?client_id=grok";
+
+        let (copy_rect, fallback_rect) = render_welcome_authenticating(
+            area,
+            &mut buf,
+            &theme,
+            logo_line_count(area.height),
+            Some(url),
+            AuthMode::Loopback,
+            "",
+            0,
+            None,
+            false,
+        );
+
+        let text = buffer_text(&buf);
+        assert!(
+            text.contains("If localhost fails, paste the callback URL"),
+            "loopback arm must explain the remote-browser paste path, got:\n{text}"
+        );
+        assert!(
+            text.contains("Paste callback URL"),
+            "loopback arm must show the callback-URL paste box, got:\n{text}"
+        );
+        assert!(
+            copy_rect.is_some(),
+            "loopback arm must expose a copy hit-rect"
+        );
+        assert!(
+            fallback_rect.is_some(),
+            "loopback arm must expose a show-full-URL hit-rect"
         );
     }
 

@@ -124,7 +124,8 @@ pub async fn run_openai_codex_login(
     if use_stdin {
         eprintln!();
         eprintln!(
-            "Paste the callback URL or authorization code here if it doesn't connect automatically:"
+            "{}",
+            crate::auth::pkce_loopback::LOOPBACK_PASTE_STDIN_PROMPT
         );
     }
 

@@ -831,6 +831,7 @@ impl acp::Agent for MvpAgent {
                                 r = crate::auth::run_provider_login(
                                     provider,
                                     channels,
+                                    login_override,
                                 ) => r,
                             }
                         }

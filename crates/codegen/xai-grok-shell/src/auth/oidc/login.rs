@@ -139,7 +139,10 @@ pub async fn run_login_flow_with_config(
     let use_stdin = !has_client_ui && std::io::stdin().is_terminal();
     if use_stdin {
         eprintln!();
-        eprintln!("Paste the URL here if it doesn't connect:");
+        eprintln!(
+            "{}",
+            crate::auth::pkce_loopback::LOOPBACK_PASTE_STDIN_PROMPT
+        );
     }
 
     // Push auth URL to the TUI via oneshot.

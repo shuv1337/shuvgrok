@@ -17,6 +17,14 @@ use tokio::net::TcpListener;
 pub const AUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(600);
 pub const LOOPBACK_PORT_OVERRIDE_ENV: &str = "GROK_OAUTH_LOOPBACK_PORT_OVERRIDE";
 
+/// CLI stdin prompt when racing a loopback callback against a paste.
+///
+/// Remote browsers land on `http://localhost/...` and fail; the address bar
+/// still holds `?code=` (and usually `state=`). Pasting that full URL is the
+/// supported recovery path.
+pub const LOOPBACK_PASTE_STDIN_PROMPT: &str =
+    "If localhost fails, paste the full callback URL from the address bar:";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Callback {
     pub code: String,
@@ -144,10 +152,39 @@ impl LoopbackListener {
     }
 }
 
+/// Whether this process likely has a GUI browser.
+///
+/// Mirrors `xai_grok_pager_render::link_opener` so login code does not depend
+/// on the pager crate. Linux/BSD require a non-empty `DISPLAY` or
+/// `WAYLAND_DISPLAY` (or a `BROWSER` override). macOS/Windows are treated as
+/// available at the env level.
+pub fn browser_open_likely_available() -> bool {
+    browser_open_likely_available_from_env(
+        std::env::var("BROWSER").ok().as_deref(),
+        std::env::var("DISPLAY").ok().as_deref(),
+        std::env::var("WAYLAND_DISPLAY").ok().as_deref(),
+    )
+}
+
+/// Pure helper for tests. See [`browser_open_likely_available`].
+pub fn browser_open_likely_available_from_env(
+    browser: Option<&str>,
+    display: Option<&str>,
+    wayland_display: Option<&str>,
+) -> bool {
+    if cfg!(any(target_os = "macos", target_os = "windows")) {
+        return true;
+    }
+    if browser.is_some_and(|v| !v.is_empty()) {
+        return true;
+    }
+    wayland_display.is_some_and(|v| !v.is_empty()) || display.is_some_and(|v| !v.is_empty())
+}
+
 /// Parse user-pasted input into `(code, state)`.
 ///
 /// Accepts:
-///   1. Full callback URL: `http://127.0.0.1:PORT/callback?code=XXX&state=YYY`
+///   1. Full callback URL (`http://127.0.0.1:…` or `http://localhost:…`)
 ///   2. Form `code#state`
 ///   3. Bare authorization code: `abc123`
 pub fn parse_pasted_input(input: &str) -> Result<Callback, String> {
@@ -571,5 +608,42 @@ mod tests {
         let res = parse_pasted_input(input).unwrap();
         assert_eq!(res.code, "bare-code-12345");
         assert_eq!(res.state, "");
+    }
+
+    #[test]
+    fn parse_pasted_input_openai_localhost_callback() {
+        let input = "http://localhost:1455/auth/callback?code=abc123code&state=state-uuid";
+        let res = parse_pasted_input(input).unwrap();
+        assert_eq!(res.code, "abc123code");
+        assert_eq!(res.state, "state-uuid");
+    }
+
+    #[test]
+    fn linux_without_display_is_headless() {
+        if cfg!(any(target_os = "macos", target_os = "windows")) {
+            assert!(browser_open_likely_available_from_env(None, None, None));
+            return;
+        }
+        assert!(!browser_open_likely_available_from_env(None, None, None));
+        assert!(!browser_open_likely_available_from_env(
+            Some(""),
+            Some(""),
+            Some("")
+        ));
+        assert!(browser_open_likely_available_from_env(
+            None,
+            Some(":0"),
+            None
+        ));
+        assert!(browser_open_likely_available_from_env(
+            None,
+            None,
+            Some("wayland-0")
+        ));
+        assert!(browser_open_likely_available_from_env(
+            Some("firefox"),
+            None,
+            None
+        ));
     }
 }

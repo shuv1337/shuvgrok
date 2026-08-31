@@ -901,6 +901,11 @@ pub async fn run_cli_login_with_provider(
                 SubscriptionProvider::Anthropic,
                 &config.grok_com_config,
             ));
+            if device_auth {
+                eprintln!(
+                    "Device-code login isn't available for Claude; using browser sign-in. If localhost fails, paste the callback URL from the address bar."
+                );
+            }
             let (_auth, _) =
                 crate::auth::anthropic::run_anthropic_login(&ant_manager, None).await?;
             eprintln!("Successfully logged in to Claude (Anthropic).");
@@ -912,7 +917,13 @@ pub async fn run_cli_login_with_provider(
                 SubscriptionProvider::OpenaiCodex,
                 &config.grok_com_config,
             ));
-            if device_auth {
+            let login_override = LoginTransportOverride::from_flags(oauth, device_auth);
+            if should_use_openai_device(login_override) {
+                if matches!(login_override, LoginTransportOverride::None) {
+                    eprintln!(
+                        "Remote or headless session — using device-code login. Pass --oauth to use the browser flow instead."
+                    );
+                }
                 let (_auth, _) =
                     crate::auth::openai_codex::run_openai_codex_device_login(&codex_manager, None)
                         .await?;
@@ -960,6 +971,28 @@ pub async fn run_cli_login(
     run_cli_login_with_provider(config, None, oauth, device_auth, devbox).await
 }
 
+/// Whether ChatGPT login should use the device flow instead of loopback.
+///
+/// `--device-auth` forces it; `--oauth` forces loopback. With neither flag,
+/// prefer device-code when this process cannot open a GUI browser (no
+/// `DISPLAY` / `WAYLAND_DISPLAY` on Linux, and no `BROWSER` override) **or**
+/// when it is an SSH session. A remote browser cannot complete a
+/// `localhost` callback on this host, including X11-forwarded SSH where
+/// `DISPLAY` is set.
+pub(crate) fn should_use_openai_device(login_override: LoginTransportOverride) -> bool {
+    let prefer_device = !crate::auth::pkce_loopback::browser_open_likely_available()
+        || xai_grok_shared::clipboard::is_remote_session();
+    should_use_openai_device_with(login_override, prefer_device)
+}
+
+fn should_use_openai_device_with(login_override: LoginTransportOverride, no_gui: bool) -> bool {
+    match login_override {
+        LoginTransportOverride::ForceDevice | LoginTransportOverride::Preresolved(true) => true,
+        LoginTransportOverride::ForceLoopback | LoginTransportOverride::Preresolved(false) => false,
+        LoginTransportOverride::None => no_gui,
+    }
+}
+
 /// Run a third-party subscription OAuth against its own `AuthManager`.
 ///
 /// Shared by the ACP `/login <provider>` path and any other caller that
@@ -969,6 +1002,7 @@ pub async fn run_cli_login(
 pub async fn run_provider_login(
     provider: SubscriptionProvider,
     channels: AuthChannels,
+    login_override: LoginTransportOverride,
 ) -> anyhow::Result<(GrokAuth, bool)> {
     let grok_home = grok_home::grok_home();
     let grok_com_config = GrokComConfig::default();
@@ -982,7 +1016,12 @@ pub async fn run_provider_login(
             crate::auth::anthropic::run_anthropic_login(&manager, Some(channels)).await
         }
         SubscriptionProvider::OpenaiCodex => {
-            crate::auth::openai_codex::run_openai_codex_login(&manager, Some(channels)).await
+            if should_use_openai_device(login_override) {
+                crate::auth::openai_codex::run_openai_codex_device_login(&manager, Some(channels))
+                    .await
+            } else {
+                crate::auth::openai_codex::run_openai_codex_login(&manager, Some(channels)).await
+            }
         }
         SubscriptionProvider::Xai => {
             anyhow::bail!("run_provider_login does not handle the xAI flow")
@@ -1488,6 +1527,34 @@ mod tests {
             );
         });
     }
+    #[test]
+    fn openai_device_follows_flags_then_no_gui() {
+        assert!(should_use_openai_device_with(
+            LoginTransportOverride::ForceDevice,
+            false
+        ));
+        assert!(!should_use_openai_device_with(
+            LoginTransportOverride::ForceLoopback,
+            true
+        ));
+        assert!(should_use_openai_device_with(
+            LoginTransportOverride::None,
+            true
+        ));
+        assert!(!should_use_openai_device_with(
+            LoginTransportOverride::None,
+            false
+        ));
+        assert!(should_use_openai_device_with(
+            LoginTransportOverride::Preresolved(true),
+            false
+        ));
+        assert!(!should_use_openai_device_with(
+            LoginTransportOverride::Preresolved(false),
+            true
+        ));
+    }
+
     #[test]
     fn from_flags_prefers_oauth_over_device() {
         assert_eq!(
